@@ -21,5 +21,7 @@ def test_compose_hardens_application_and_keeps_searxng_internal() -> None:
 
 def test_dockerfile_runs_as_non_root() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "mkdir -p /data" in dockerfile
+    assert "chown conference-scout:conference-scout /data" in dockerfile
     assert "USER conference-scout" in dockerfile
     assert "conference-scout-healthcheck" in dockerfile
