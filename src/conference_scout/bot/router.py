@@ -6,6 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from conference_scout.bot.access import OwnerOnlyMiddleware
+from conference_scout.bot.errors import ExternalErrorMiddleware
 from conference_scout.bot.keyboards import add_buttons, main_menu, topic_confirmation
 from conference_scout.bot.states import SourceFlow, TopicFlow
 from conference_scout.schemas.common import SourceType
@@ -13,6 +14,8 @@ from conference_scout.schemas.common import SourceType
 
 def build_router(*, owner_telegram_id: int) -> Router:
     router = Router(name="owner")
+    router.message.middleware(ExternalErrorMiddleware())
+    router.callback_query.middleware(ExternalErrorMiddleware())
     router.message.middleware(OwnerOnlyMiddleware(owner_telegram_id))
     router.callback_query.middleware(OwnerOnlyMiddleware(owner_telegram_id))
 
