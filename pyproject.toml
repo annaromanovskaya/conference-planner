@@ -47,3 +47,4 @@ extend-exclude = ["TASK.md", "docs/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["RUF001"]

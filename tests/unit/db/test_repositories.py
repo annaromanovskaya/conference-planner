@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -134,3 +135,18 @@ async def test_reminder_candidates_only_include_owner_tracking(session: AsyncSes
 
     assert len(candidates) == 1
     assert candidates[0].conference_name == "Tracked"
+
+
+@pytest.mark.asyncio
+async def test_tracking_creates_owner_subscription(session: AsyncSession) -> None:
+    owner = await UserRepository(session).get_or_create_by_telegram_id(123)
+    conference = Conference(name="New", normalized_name="new")
+    session.add(conference)
+    await session.flush()
+
+    await ConferenceRepository(session).track(owner.id, conference.id)
+    await session.commit()
+
+    subscription = await session.scalar(select(Subscription))
+    assert subscription is not None
+    assert conference.status == ConferenceStatus.TRACKING

@@ -4,7 +4,7 @@ Last updated: 2026-09-05
 
 ## Current stage
 
-Foundation, discovery, monitoring, reminders, and scheduling are complete. Telegram UX is next.
+Core services and owner-only Telegram UX are complete. Application composition and Docker are next.
 
 ## Completed
 
@@ -34,10 +34,14 @@ Foundation, discovery, monitoring, reminders, and scheduling are complete. Teleg
 - Added SQLite-backed reminder candidate selection for tracked subscriptions and persisted duplicate checks.
 - Added daily monitoring of official/deadline URLs with transactional current-date updates, history rows,
   source verification, and post-commit change DTOs for Telegram notification.
+- Added owner-only Telegram middleware that rejects other IDs without exposing configuration.
+- Added Russian main menu, topic normalization preview/confirmation, trusted source input and controls,
+  manual discovery, conference grouping/tracking/archive actions, and upcoming deadline output.
+- Added repository-backed topic, trusted-source, and conference tracking operations.
 
 ## Remaining
 
-- Implement Telegram UX.
+- Compose per-update database dependencies and application lifecycle.
 - Add Docker deployment, documentation, and final verification.
 
 ## Verification
@@ -49,12 +53,13 @@ Foundation, discovery, monitoring, reminders, and scheduling are complete. Teleg
 - Full unit and discovery integration suite: 37 passed; Ruff passed.
 - Focused reminder/scheduler suite: 8 passed; Ruff passed.
 - Full suite after monitoring/reminders: 47 passed; Ruff format/check passed.
+- Full suite after Telegram UX: 56 passed; Ruff passed.
 - Async SQLite tests require execution outside the restricted development sandbox because `aiosqlite` uses worker threads; this does not affect the container runtime.
 
 ## Latest major commit
 
-`bb3f91f feat: add source-backed conference discovery` (monitoring commit pending).
+`5d7302d feat: monitor deadlines and schedule reminders` (Telegram commit pending).
 
 ## Uncommitted work
 
-- Complete monitoring/reminders/scheduler stage, ready for its major commit.
+- Complete Telegram UX stage, ready for its major commit.
