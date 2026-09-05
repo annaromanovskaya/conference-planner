@@ -4,7 +4,8 @@ Last updated: 2026-09-05
 
 ## Current stage
 
-Core services and owner-only Telegram UX are complete. Application composition and Docker are next.
+Implementation, application composition, deployment files, and documentation are complete.
+Docker runtime verification is blocked because Docker is unavailable in the current WSL environment.
 
 ## Completed
 
@@ -38,11 +39,14 @@ Core services and owner-only Telegram UX are complete. Application composition a
 - Added Russian main menu, topic normalization preview/confirmation, trusted source input and controls,
   manual discovery, conference grouping/tracking/archive actions, and upcoming deadline output.
 - Added repository-backed topic, trusted-source, and conference tracking operations.
+- Added the composition root, per-update repository sessions, scheduled job wiring, graceful shutdown,
+  and SQLite-only healthcheck.
+- Added a non-root multi-stage Dockerfile, hardened Compose services, internal SearXNG JSON config,
+  `.dockerignore`, GitHub-ready README, and MIT license.
 
 ## Remaining
 
-- Compose per-update database dependencies and application lifecycle.
-- Add Docker deployment, documentation, and final verification.
+- Run `docker compose config` and `docker build -t conference-scout:test .` on a host with Docker.
 
 ## Verification
 
@@ -54,12 +58,17 @@ Core services and owner-only Telegram UX are complete. Application composition a
 - Focused reminder/scheduler suite: 8 passed; Ruff passed.
 - Full suite after monitoring/reminders: 47 passed; Ruff format/check passed.
 - Full suite after Telegram UX: 56 passed; Ruff passed.
+- Final local suite: 62 passed; Ruff format/check passed.
+- `uv build`: source distribution and wheel built successfully.
+- Application/healthcheck imports: passed.
+- Secret scan: no token/API-key patterns found; `.env`, virtualenvs, and databases are ignored.
+- Docker verification attempted but could not start: `docker` is not installed/enabled in this WSL distro.
 - Async SQLite tests require execution outside the restricted development sandbox because `aiosqlite` uses worker threads; this does not affect the container runtime.
 
 ## Latest major commit
 
-`5d7302d feat: monitor deadlines and schedule reminders` (Telegram commit pending).
+`d7d8f85 feat: add personal Telegram bot interface` (deployment commit pending).
 
 ## Uncommitted work
 
-- Complete Telegram UX stage, ready for its major commit.
+- Final deployment/documentation stage, ready for its major commit.
