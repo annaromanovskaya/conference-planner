@@ -4,7 +4,7 @@ Last updated: 2026-09-05
 
 ## Current stage
 
-Foundation/persistence and source-backed discovery are complete. Monitoring/reminders are next.
+Foundation, discovery, monitoring, reminders, and scheduling are complete. Telegram UX is next.
 
 ## Completed
 
@@ -28,10 +28,15 @@ Foundation/persistence and source-backed discovery are complete. Monitoring/remi
 - Added topic normalization and relevance scoring with validated structured responses.
 - Added discovery orchestration with per-query/per-candidate isolation, trusted domain/page use,
   provenance verification, relevance thresholding, and SQLite persistence.
+- Added deterministic reminder offset calculation and a reminder processing service that records
+  only successful deliveries and suppresses repeats.
+- Added stable APScheduler weekly/daily/hourly jobs with coalescing and single-instance limits.
+- Added SQLite-backed reminder candidate selection for tracked subscriptions and persisted duplicate checks.
+- Added daily monitoring of official/deadline URLs with transactional current-date updates, history rows,
+  source verification, and post-commit change DTOs for Telegram notification.
 
 ## Remaining
 
-- Implement monitoring, deadline history, reminders, and scheduling.
 - Implement Telegram UX.
 - Add Docker deployment, documentation, and final verification.
 
@@ -42,12 +47,14 @@ Foundation/persistence and source-backed discovery are complete. Monitoring/remi
 - Focused search/web/deduplication suite: 13 passed.
 - Expanded search/web/AI/deduplication suite: 20 passed.
 - Full unit and discovery integration suite: 37 passed; Ruff passed.
+- Focused reminder/scheduler suite: 8 passed; Ruff passed.
+- Full suite after monitoring/reminders: 47 passed; Ruff format/check passed.
 - Async SQLite tests require execution outside the restricted development sandbox because `aiosqlite` uses worker threads; this does not affect the container runtime.
 
 ## Latest major commit
 
-`54b7643 feat: establish application foundation and persistence` (discovery commit pending).
+`bb3f91f feat: add source-backed conference discovery` (monitoring commit pending).
 
 ## Uncommitted work
 
-- Complete integrations/discovery stage, ready for its major commit.
+- Complete monitoring/reminders/scheduler stage, ready for its major commit.

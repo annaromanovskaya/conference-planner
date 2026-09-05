@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from conference_scout.db.models import Conference, Deadline
+from conference_scout.db.models import Conference, Deadline, Subscription
 from conference_scout.db.repositories.conferences import ConferenceRepository
 from conference_scout.db.repositories.reminders import ReminderRepository
 from conference_scout.db.repositories.users import UserRepository
@@ -110,3 +110,27 @@ async def test_reminder_uniqueness_is_database_enforced(session: AsyncSession) -
 
     with pytest.raises(IntegrityError):
         await repository.record_sent(owner.id, deadline.id, 14, datetime.now(UTC))
+
+
+@pytest.mark.asyncio
+async def test_reminder_candidates_only_include_owner_tracking(session: AsyncSession) -> None:
+    owner = await UserRepository(session).get_or_create_by_telegram_id(123)
+    conference = Conference(name="Tracked", normalized_name="tracked")
+    session.add(conference)
+    await session.flush()
+    session.add(Subscription(user_id=owner.id, conference_id=conference.id))
+    deadline = Deadline(
+        conference_id=conference.id,
+        deadline_type=DeadlineType.REGISTRATION,
+        deadline_date=date(2027, 3, 1),
+        source_url="https://event.example",
+        verified=True,
+        last_checked_at=datetime.now(UTC),
+    )
+    session.add(deadline)
+    await session.commit()
+
+    candidates = await ReminderRepository(session).candidates(owner.id)
+
+    assert len(candidates) == 1
+    assert candidates[0].conference_name == "Tracked"

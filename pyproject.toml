@@ -35,7 +35,7 @@ conference-scout-healthcheck = "conference_scout.healthcheck:run"
 packages = ["src/conference_scout"]
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers"
+addopts = "--strict-markers --import-mode=importlib"
 asyncio_mode = "strict"
 testpaths = ["tests"]
 
@@ -43,6 +43,7 @@ testpaths = ["tests"]
 target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
+extend-exclude = ["TASK.md", "docs/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
