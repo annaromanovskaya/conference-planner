@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "conference-scout"
+version = "0.1.0"
+description = "Personal self-hosted Telegram bot for scientific conference deadline tracking"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "aiogram>=3.20,<4",
+  "aiosqlite>=0.21,<1",
+  "apscheduler>=3.11,<4",
+  "beautifulsoup4>=4.13,<5",
+  "httpx>=0.28,<1",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "rapidfuzz>=3.13,<4",
+  "sqlalchemy>=2.0.41,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+conference-scout = "conference_scout.main:run"
+conference-scout-healthcheck = "conference_scout.healthcheck:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/conference_scout"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
