@@ -13,8 +13,27 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr
     owner_telegram_id: int = Field(gt=0)
-    openrouter_api_key: SecretStr
-    openrouter_model: str = Field(min_length=1)
+    ollama_cloud_base_url: HttpUrl = HttpUrl("https://ollama.com")
+    ollama_cloud_api_key: SecretStr | None = None
+    ollama_cloud_free_models: Annotated[tuple[str, ...], NoDecode] = (
+        "gemma4:31b",
+        "gpt-oss:120b",
+        "gpt-oss:20b",
+        "nemotron-3-nano:30b",
+        "nemotron-3-super",
+        "nemotron-3-ultra",
+    )
+    ollama_local_base_url: HttpUrl | None = None
+    ollama_local_api_key: SecretStr | None = None
+    local_openai_base_url: HttpUrl | None = None
+    local_openai_api_key: SecretStr | None = None
+    agent_max_steps: int = Field(default=6, ge=1, le=20)
+    agent_max_tool_calls_per_step: int = Field(default=3, ge=1, le=20)
+    agent_timeout_seconds: float = Field(default=90, gt=0, le=600)
+    agent_max_context_chars: int = Field(default=24_000, ge=1_000)
+    agent_max_tool_result_chars: int = Field(default=12_000, ge=1_000)
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = Field(default=8765, ge=1, le=65_535)
     database_url: str = "sqlite+aiosqlite:////data/conference_scout.db"
     searxng_url: HttpUrl = HttpUrl("http://searxng:8080")
     discovery_day: str = "sun"
@@ -39,6 +58,24 @@ class Settings(BaseSettings):
             except ValueError as exc:
                 raise ValueError("REMINDER_DAYS must contain comma-separated integers") from exc
             return parsed
+        return value
+
+    @field_validator("ollama_cloud_free_models", mode="before")
+    @classmethod
+    def parse_cloud_models(cls, value: object) -> object:
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("OLLAMA_CLOUD_FREE_MODELS cannot be empty")
+            return tuple(item.strip() for item in value.split(",") if item.strip())
+        return value
+
+    @field_validator("ollama_cloud_free_models")
+    @classmethod
+    def validate_cloud_models(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or any(not item.strip() for item in value):
+            raise ValueError("cloud model allowlist must not be empty")
+        if len(set(value)) != len(value):
+            raise ValueError("cloud model allowlist must be unique")
         return value
 
     @field_validator("reminder_days")
