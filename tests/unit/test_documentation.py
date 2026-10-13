@@ -36,5 +36,6 @@ def test_readme_contains_required_operator_sections() -> None:
 def test_example_environment_contains_no_real_secrets() -> None:
     example = (ROOT / ".env.example").read_text()
     assert "YOUR_TELEGRAM_BOT_TOKEN" in example
-    assert "YOUR_OPENROUTER_API_KEY" in example
+    assert "YOUR_OLLAMA_CLOUD_API_KEY" in example
     assert "sk-or-" not in example
+    assert "hub_" not in example

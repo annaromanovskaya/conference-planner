@@ -40,4 +40,10 @@ class RepositoryMiddleware(BaseMiddleware):
                 data[key] = repository
             if self.service_factory is not None:
                 data.update(self.service_factory(session))
-            return await handler(event, data)
+            try:
+                result = await handler(event, data)
+                await session.commit()
+                return result
+            except BaseException:
+                await session.rollback()
+                raise

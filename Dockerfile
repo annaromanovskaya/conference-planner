@@ -11,6 +11,8 @@ RUN groupadd --system conference-scout && \
     mkdir -p /data && \
     chown conference-scout:conference-scout /data
 COPY --from=builder /install /usr/local
+COPY alembic.ini /app/alembic.ini
+COPY migrations /app/migrations
 USER conference-scout
 WORKDIR /app
 ENTRYPOINT ["conference-scout"]
