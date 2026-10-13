@@ -1,9 +1,14 @@
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from conference_scout.schemas.common import MemoryKind, MemoryScope
+from conference_scout.schemas.common import (
+    MemoryKind,
+    MemoryScope,
+    PendingActionStatus,
+    SourceType,
+)
 
 
 class DomainReference(BaseModel):
@@ -98,3 +103,110 @@ class KnowledgeSubgraph(BaseModel):
 
     nodes: tuple[KnowledgeNode, ...] = ()
     edges: tuple[KnowledgeEdge, ...] = ()
+
+
+class AddTopicAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["add_topic"] = "add_topic"
+    name: str = Field(min_length=1)
+    description: str = ""
+    keywords: tuple[str, ...] = ()
+
+    def confirmation_summary(self) -> str:
+        return f"Добавить тему «{self.name}»"
+
+
+class AddSourceAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["add_source"] = "add_source"
+    source_type: SourceType
+    value: str = Field(min_length=1)
+
+    def confirmation_summary(self) -> str:
+        return f"Добавить источник {self.value}"
+
+
+class TrackConferenceAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["track_conference"] = "track_conference"
+    conference_id: int = Field(gt=0)
+
+    def confirmation_summary(self) -> str:
+        return f"Отслеживать конференцию {self.conference_id}"
+
+
+class ArchiveConferenceAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["archive_conference"] = "archive_conference"
+    conference_id: int = Field(gt=0)
+
+    def confirmation_summary(self) -> str:
+        return f"Перенести в архив конференцию {self.conference_id}"
+
+
+class SaveMemoryAction(MemoryProposal):
+    action: Literal["save_memory"] = "save_memory"
+
+    def confirmation_summary(self) -> str:
+        return f"Запомнить: {self.original_text}"
+
+
+class ForgetMemoryAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["forget_memory"] = "forget_memory"
+    memory_id: int = Field(gt=0)
+
+    def confirmation_summary(self) -> str:
+        return f"Забыть запись памяти {self.memory_id}"
+
+
+class RunDiscoveryAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["run_discovery"] = "run_discovery"
+    years: tuple[int, ...] = Field(min_length=1)
+
+    def confirmation_summary(self) -> str:
+        years = ", ".join(str(year) for year in self.years)
+        return f"Запустить поиск конференций за {years}"
+
+
+ActionPayload = Annotated[
+    AddTopicAction
+    | AddSourceAction
+    | TrackConferenceAction
+    | ArchiveConferenceAction
+    | SaveMemoryAction
+    | ForgetMemoryAction
+    | RunDiscoveryAction,
+    Field(discriminator="action"),
+]
+
+ACTION_PAYLOAD_ADAPTER = TypeAdapter(ActionPayload)
+
+
+def parse_action_payload(data: Any) -> ActionPayload:
+    return ACTION_PAYLOAD_ADAPTER.validate_python(data)
+
+
+class PendingActionView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    action_type: str
+    summary: str
+    status: PendingActionStatus
+    expires_at: datetime
+
+
+class ActionResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action_id: int
+    success: bool
+    message: str
