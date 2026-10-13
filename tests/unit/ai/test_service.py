@@ -1,5 +1,8 @@
 import pytest
 
+from conference_scout.ai.active_provider import ActiveLLMProvider
+from conference_scout.ai.models import AvailableModel, ChatResponse
+from conference_scout.ai.registry import ActiveModel
 from conference_scout.ai.service import AIResponseError, AIService
 from conference_scout.schemas.conferences import ConferenceExtraction
 
@@ -13,6 +16,32 @@ class FakeProvider:
         response = self.responses[self.calls]
         self.calls += 1
         return response
+
+
+class RecordingGateway:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, list, tuple]] = []
+
+    async def list_models(self) -> tuple[AvailableModel, ...]:
+        return (AvailableModel(name="selected-model"),)
+
+    async def chat(self, model, messages, tools=()) -> ChatResponse:
+        self.calls.append((model, list(messages), tuple(tools)))
+        return ChatResponse(content=self.responses.pop(0))
+
+
+class FakeRegistry:
+    def __init__(self, gateway: RecordingGateway) -> None:
+        self.gateway = gateway
+
+    async def get_active(self, user_id: int) -> ActiveModel:
+        assert user_id == 42
+        return ActiveModel("local", "selected-model", True)
+
+    def gateway_for(self, profile_id: str) -> RecordingGateway:
+        assert profile_id == "local"
+        return self.gateway
 
 
 @pytest.mark.asyncio
@@ -66,3 +95,38 @@ async def test_relevance_is_validated() -> None:
         {"name": "Astroinformatics", "description": "ML", "keywords": ["astroinformatics"]},
     )
     assert result.score == 0.91
+
+
+@pytest.mark.asyncio
+async def test_active_provider_resolves_selected_model_for_every_completion() -> None:
+    gateway = RecordingGateway(['{"ok":true}'])
+    provider = ActiveLLMProvider(FakeRegistry(gateway), user_id=42)
+
+    result = await provider.complete("Return JSON only.", "question")
+
+    assert result == '{"ok":true}'
+    model, messages, tools = gateway.calls[0]
+    assert model == "selected-model"
+    assert [(item.role, item.content) for item in messages] == [
+        ("system", "Return JSON only."),
+        ("user", "question"),
+    ]
+    assert tools == ()
+
+
+@pytest.mark.asyncio
+async def test_active_provider_keeps_bounded_structured_validation_retries() -> None:
+    gateway = RecordingGateway(
+        [
+            "not-json",
+            '{"name":"Astroinformatics","description":"ML",'
+            '"keywords":["machine learning astronomy"]}',
+        ]
+    )
+    service = AIService(ActiveLLMProvider(FakeRegistry(gateway), user_id=42), max_attempts=2)
+
+    result = await service.normalize_topic("ML astronomy")
+
+    assert result.name == "Astroinformatics"
+    assert len(gateway.calls) == 2
+    assert all("Return only JSON" in call[1][0].content for call in gateway.calls)
