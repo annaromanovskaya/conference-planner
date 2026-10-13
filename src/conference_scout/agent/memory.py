@@ -3,6 +3,7 @@ from collections.abc import Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from conference_scout.agent.prompts import serialize_memory_views
 from conference_scout.db.models import UserMemory
 from conference_scout.db.repositories.conversations import ConversationRepository
 from conference_scout.db.repositories.memories import MemoryRepository
@@ -30,7 +31,7 @@ class MemoryService:
         records = await self.conversations.list_messages(user_id, conversation.id)
         selected = []
         used = 0
-        message_budget = max(0, self.max_context_chars - len(conversation.summary))
+        message_budget = max(0, self.max_context_chars - len(conversation.summary) - 2)
         for record in reversed(records):
             size = len(record.content)
             if selected and used + size > message_budget:
@@ -51,17 +52,23 @@ class MemoryService:
         )
         memory_budget = max(0, self.max_context_chars - len(conversation.summary) - used)
         memory_views = []
-        memory_used = 0
-        for memory in await self.memories.list_active(user_id):
-            if not self._is_relevant(memory, query):
+        relevant = [
+            memory
+            for memory in await self.memories.list_active(user_id)
+            if self._is_relevant(memory, query)
+        ]
+        priority = {
+            "INSTRUCTION": 0,
+            "PREFERENCE": 1,
+            "NOTE": 2,
+        }
+        relevant.sort(key=lambda item: (priority[item.kind.value], -item.id))
+        for memory in relevant:
+            view = self._view(memory)
+            candidate = [*memory_views, view]
+            if len(serialize_memory_views(candidate)) > memory_budget:
                 continue
-            size = len(memory.original_text) + len(
-                json.dumps(memory.structured_data, ensure_ascii=False, default=str)
-            )
-            if memory_used + size > memory_budget:
-                continue
-            memory_views.append(self._view(memory))
-            memory_used += size
+            memory_views.append(view)
         return MemoryContext(
             conversation_id=conversation.id,
             summary=conversation.summary,

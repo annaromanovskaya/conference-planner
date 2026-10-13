@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,7 +111,7 @@ async def test_compaction_removes_summarized_text_but_keeps_domain_references(
 async def test_memory_retrieval_and_conflicts_are_owner_scoped(session: AsyncSession) -> None:
     owner_id = await _owner_id(session)
     other = await UserRepository(session).get_or_create_by_telegram_id(456)
-    service = MemoryService(session, max_context_chars=100)
+    service = MemoryService(session, max_context_chars=300)
     exclude = MemoryProposal(
         kind=MemoryKind.PREFERENCE,
         scope=MemoryScope.GLOBAL,
@@ -158,7 +160,69 @@ async def test_long_term_memories_are_bounded_by_context_budget(session: AsyncSe
 
     context = await service.get_context(owner_id, "anything")
 
-    assert 0 < len(context.memories) < 10
-    assert [memory.rule_data["priority"] for memory in context.memories] == list(
-        range(len(context.memories))
+    serialized = json.dumps(
+        [
+            {
+                "kind": memory.kind.value,
+                "scope": memory.scope.value,
+                "text": memory.original_text,
+                "rule": memory.rule_data,
+            }
+            for memory in context.memories
+        ],
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
     )
+    assert 0 < len(context.memories) < 10
+    assert len(serialized) <= 240
+    assert context.memories[0].rule_data["priority"] == 9
+
+
+@pytest.mark.asyncio
+async def test_short_memories_include_json_overhead_and_prioritize_instructions(
+    session: AsyncSession,
+) -> None:
+    owner_id = await _owner_id(session)
+    service = MemoryService(session, max_context_chars=190)
+    for _ in range(20):
+        await service.save_memory(
+            owner_id,
+            MemoryProposal(
+                kind=MemoryKind.NOTE,
+                scope=MemoryScope.GLOBAL,
+                original_text="x",
+                rule_data={},
+                provenance={"source": "test"},
+            ),
+        )
+    important = await service.save_memory(
+        owner_id,
+        MemoryProposal(
+            kind=MemoryKind.INSTRUCTION,
+            scope=MemoryScope.GLOBAL,
+            original_text="Never suggest USA events",
+            rule_data={"exclude_country": "US"},
+            provenance={"source": "test"},
+        ),
+    )
+
+    context = await service.get_context(owner_id, "events")
+    serialized = json.dumps(
+        [
+            {
+                "kind": memory.kind.value,
+                "scope": memory.scope.value,
+                "text": memory.original_text,
+                "rule": memory.rule_data,
+            }
+            for memory in context.memories
+        ],
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
+    )
+
+    assert context.memories[0].id == important.id
+    assert len(serialized) <= 190
+    assert len(context.memories) < 20
