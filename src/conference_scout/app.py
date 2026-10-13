@@ -295,7 +295,7 @@ def _build_action_executors(
     async def archive(user_id: int, payload: ArchiveConferenceAction) -> str:
         repository = ConferenceRepository(session)
         await repository.require_accessible(user_id, payload.conference_id)
-        await repository.archive(payload.conference_id)
+        await repository.archive(user_id, payload.conference_id)
         return "Конференция перемещена в архив."
 
     async def save_memory(user_id: int, payload: SaveMemoryAction) -> str:

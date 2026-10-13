@@ -100,7 +100,9 @@ async def test_selected_model_to_mcp_proposal_to_confirmed_domain_action(session
     reply = await runtime.respond(user.id, "Отслеживай Astro 2027")
     result = await confirmation.confirm(user.id, reply.pending_actions[0].id)
 
-    tracked = await ConferenceRepository(session).list_by_status(ConferenceStatus.TRACKING)
+    tracked = await ConferenceRepository(session).list_accessible_by_status(
+        user.id, ConferenceStatus.TRACKING
+    )
     assert result.success is True
     assert [item.id for item in tracked] == [conference.id]
 

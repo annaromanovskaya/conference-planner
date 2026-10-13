@@ -217,6 +217,49 @@ async def test_claimed_action_cannot_be_executed_by_duplicate_callback(
 
 
 @pytest.mark.asyncio
+async def test_expired_execution_lease_is_recovered(session: AsyncSession) -> None:
+    owner_id, _ = await _users(session)
+    now = datetime(2026, 10, 13, tzinfo=UTC)
+    action = await PendingActionRepository(session).create(
+        owner_id,
+        action_type="track_conference",
+        payload={"action": "track_conference", "conference_id": 1},
+        summary="tracking",
+        expires_at=now - timedelta(seconds=1),
+    )
+    action.status = PendingActionStatus.EXECUTING
+    await session.commit()
+
+    service = ConfirmationService(
+        session,
+        executors={"track_conference": lambda _user_id, _payload: None},
+        clock=lambda: now,
+    )
+    with pytest.raises(ActionUnavailable, match="expired"):
+        await service.confirm(owner_id, action.id)
+
+    loaded = await PendingActionRepository(session).get_for_user(owner_id, action.id)
+    assert loaded is not None and loaded.status == PendingActionStatus.EXPIRED
+
+
+@pytest.mark.asyncio
+async def test_cancelled_executor_releases_claim_for_retry(session: AsyncSession) -> None:
+    owner_id, _ = await _users(session)
+
+    async def cancel(_user_id: int, _payload) -> str:
+        raise asyncio.CancelledError
+
+    service = ConfirmationService(session, executors={"track_conference": cancel})
+    pending = await service.propose(owner_id, TrackConferenceAction(conference_id=17))
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.confirm(owner_id, pending.id)
+
+    loaded = await PendingActionRepository(session).get_for_user(owner_id, pending.id)
+    assert loaded is not None and loaded.status == PendingActionStatus.FAILED
+
+
+@pytest.mark.asyncio
 async def test_concurrent_confirmations_claim_action_once(session: AsyncSession) -> None:
     owner_id, _ = await _users(session)
     action = await PendingActionRepository(session).create(

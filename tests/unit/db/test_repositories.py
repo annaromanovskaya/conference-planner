@@ -136,6 +136,12 @@ async def test_reminder_candidates_only_include_owner_tracking(session: AsyncSes
     assert len(candidates) == 1
     assert candidates[0].conference_name == "Tracked"
 
+    subscription = await session.scalar(select(Subscription))
+    assert subscription is not None
+    subscription.status = ConferenceStatus.ARCHIVED
+    await session.commit()
+    assert await ReminderRepository(session).candidates(owner.id) == []
+
 
 @pytest.mark.asyncio
 async def test_tracking_creates_owner_subscription(session: AsyncSession) -> None:
@@ -149,4 +155,33 @@ async def test_tracking_creates_owner_subscription(session: AsyncSession) -> Non
 
     subscription = await session.scalar(select(Subscription))
     assert subscription is not None
-    assert conference.status == ConferenceStatus.TRACKING
+    assert subscription.status == ConferenceStatus.TRACKING
+    assert conference.status == ConferenceStatus.DISCOVERED
+
+
+@pytest.mark.asyncio
+async def test_archive_is_owner_scoped_and_does_not_mutate_conference(
+    session: AsyncSession,
+) -> None:
+    users = UserRepository(session)
+    first = await users.get_or_create_by_telegram_id(123)
+    second = await users.get_or_create_by_telegram_id(456)
+    conference = Conference(name="Shared", normalized_name="shared")
+    session.add(conference)
+    await session.flush()
+    repository = ConferenceRepository(session)
+    await repository.track(first.id, conference.id)
+    await repository.track(second.id, conference.id)
+    await repository.archive(first.id, conference.id)
+    await session.commit()
+
+    assert [
+        item.id
+        for item in await repository.list_accessible_by_status(first.id, ConferenceStatus.ARCHIVED)
+    ] == [conference.id]
+    assert await repository.list_accessible_by_status(first.id, ConferenceStatus.TRACKING) == []
+    assert [
+        item.id
+        for item in await repository.list_accessible_by_status(second.id, ConferenceStatus.TRACKING)
+    ] == [conference.id]
+    assert conference.status == ConferenceStatus.DISCOVERED

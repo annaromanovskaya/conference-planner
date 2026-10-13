@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 
@@ -53,12 +54,19 @@ class ConfirmationService:
         action = await self._get_for_update(user_id, action_id)
         if action is None:
             raise ActionUnavailable("action not found")
-        self._ensure_available(action)
+
+        if action.status in {
+            PendingActionStatus.EXECUTED,
+            PendingActionStatus.CANCELLED,
+            PendingActionStatus.EXPIRED,
+        }:
+            self._ensure_available(action)
 
         if self._as_utc(action.expires_at) <= self._as_utc(self.clock()):
             action.status = PendingActionStatus.EXPIRED
             await self.session.commit()
             raise ActionUnavailable("action expired")
+        self._ensure_available(action)
 
         claimed = await self.session.execute(
             update(PendingAction)
@@ -97,13 +105,11 @@ class ConfirmationService:
             action.status = PendingActionStatus.EXECUTED
             action.error = None
             await self.session.commit()
+        except asyncio.CancelledError:
+            await self._mark_failed(user_id, action_id)
+            raise
         except Exception as exc:
-            await self.session.rollback()
-            failed = await self._get_for_update(user_id, action_id)
-            if failed is not None:
-                failed.status = PendingActionStatus.FAILED
-                failed.error = "action execution failed"
-                await self.session.commit()
+            await self._mark_failed(user_id, action_id)
             raise ActionUnavailable("action execution failed") from exc
 
         return ActionResult(action_id=action_id, success=True, message=message)
@@ -125,6 +131,14 @@ class ConfirmationService:
             .where(PendingAction.id == action_id, PendingAction.user_id == user_id)
             .with_for_update()
         )
+
+    async def _mark_failed(self, user_id: int, action_id: int) -> None:
+        await self.session.rollback()
+        failed = await self._get_for_update(user_id, action_id)
+        if failed is not None and failed.status == PendingActionStatus.EXECUTING:
+            failed.status = PendingActionStatus.FAILED
+            failed.error = "action execution failed"
+            await self.session.commit()
 
     @staticmethod
     def _ensure_available(action: PendingAction) -> None:

@@ -138,3 +138,27 @@ async def test_memory_retrieval_and_conflicts_are_owner_scoped(session: AsyncSes
     assert [item.id for item in context.memories] == [kept.id]
     assert equivalent.equivalent_ids == (kept.id,)
     assert opposite.conflicting_ids == (kept.id,)
+
+
+@pytest.mark.asyncio
+async def test_long_term_memories_are_bounded_by_context_budget(session: AsyncSession) -> None:
+    owner_id = await _owner_id(session)
+    service = MemoryService(session, max_context_chars=240)
+    for index in range(10):
+        await service.save_memory(
+            owner_id,
+            MemoryProposal(
+                kind=MemoryKind.NOTE,
+                scope=MemoryScope.GLOBAL,
+                original_text=f"priority note {index} " + "x" * 40,
+                rule_data={"priority": index},
+                provenance={"source": "test"},
+            ),
+        )
+
+    context = await service.get_context(owner_id, "anything")
+
+    assert 0 < len(context.memories) < 10
+    assert [memory.rule_data["priority"] for memory in context.memories] == list(
+        range(len(context.memories))
+    )

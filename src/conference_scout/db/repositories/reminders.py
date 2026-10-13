@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from conference_scout.db.models import Conference, Deadline, Reminder, Subscription
 from conference_scout.reminders.service import ReminderCandidate
+from conference_scout.schemas.common import ConferenceStatus
 
 
 class ReminderRepository:
@@ -29,7 +30,10 @@ class ReminderRepository:
             select(Deadline, Conference.name)
             .join(Conference, Conference.id == Deadline.conference_id)
             .join(Subscription, Subscription.conference_id == Conference.id)
-            .where(Subscription.user_id == user_id)
+            .where(
+                Subscription.user_id == user_id,
+                Subscription.status == ConferenceStatus.TRACKING,
+            )
         )
         return [
             ReminderCandidate(

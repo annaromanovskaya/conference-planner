@@ -12,6 +12,7 @@ from conference_scout.db.models import (
     UserMemory,
 )
 from conference_scout.schemas.agent import KnowledgeEdge, KnowledgeNode, KnowledgeSubgraph
+from conference_scout.schemas.common import ConferenceStatus
 
 
 class KnowledgeGraphService:
@@ -176,6 +177,7 @@ class KnowledgeGraphService:
             select(Subscription).where(
                 Subscription.user_id == user_id,
                 Subscription.conference_id == conference_id,
+                Subscription.status == ConferenceStatus.TRACKING,
             )
         )
         if tracked is not None:

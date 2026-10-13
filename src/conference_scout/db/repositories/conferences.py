@@ -30,13 +30,30 @@ class ConferenceRepository:
     async def list_accessible_by_status(
         self, user_id: int, status: ConferenceStatus
     ) -> list[Conference]:
+        if status in {ConferenceStatus.TRACKING, ConferenceStatus.ARCHIVED}:
+            return list(
+                await self.session.scalars(
+                    select(Conference)
+                    .join(Subscription, Subscription.conference_id == Conference.id)
+                    .where(
+                        Subscription.user_id == user_id,
+                        Subscription.status == status,
+                    )
+                    .order_by(Conference.start_date)
+                )
+            )
         ids = await self.accessible_ids(user_id)
         if not ids:
             return []
+        subscribed = select(Subscription.conference_id).where(Subscription.user_id == user_id)
         return list(
             await self.session.scalars(
                 select(Conference)
-                .where(Conference.id.in_(ids), Conference.status == status)
+                .where(
+                    Conference.id.in_(ids),
+                    Conference.status == status,
+                    Conference.id.not_in(subscribed),
+                )
                 .order_by(Conference.start_date)
             )
         )
@@ -72,14 +89,25 @@ class ConferenceRepository:
             subscription = Subscription(user_id=user_id, conference_id=conference_id)
             self.session.add(subscription)
         subscription.status = ConferenceStatus.TRACKING
-        conference.status = ConferenceStatus.TRACKING
         await self.session.flush()
         return subscription
 
-    async def archive(self, conference_id: int) -> None:
+    async def archive(self, user_id: int, conference_id: int) -> Subscription:
         conference = await self.session.get(Conference, conference_id)
-        if conference is not None:
-            conference.status = ConferenceStatus.ARCHIVED
+        if conference is None:
+            raise ValueError("conference not found")
+        subscription = await self.session.scalar(
+            select(Subscription).where(
+                Subscription.user_id == user_id,
+                Subscription.conference_id == conference_id,
+            )
+        )
+        if subscription is None:
+            subscription = Subscription(user_id=user_id, conference_id=conference_id)
+            self.session.add(subscription)
+        subscription.status = ConferenceStatus.ARCHIVED
+        await self.session.flush()
+        return subscription
 
     async def update_deadline(
         self,

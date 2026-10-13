@@ -49,16 +49,24 @@ class MemoryService:
             )
             for record in selected
         )
-        memories = tuple(
-            self._view(memory)
-            for memory in await self.memories.list_active(user_id)
-            if self._is_relevant(memory, query)
-        )
+        memory_budget = max(0, self.max_context_chars - len(conversation.summary) - used)
+        memory_views = []
+        memory_used = 0
+        for memory in await self.memories.list_active(user_id):
+            if not self._is_relevant(memory, query):
+                continue
+            size = len(memory.original_text) + len(
+                json.dumps(memory.structured_data, ensure_ascii=False, default=str)
+            )
+            if memory_used + size > memory_budget:
+                continue
+            memory_views.append(self._view(memory))
+            memory_used += size
         return MemoryContext(
             conversation_id=conversation.id,
             summary=conversation.summary,
             messages=messages,
-            memories=memories,
+            memories=tuple(memory_views),
         )
 
     async def append_message(

@@ -31,7 +31,7 @@ confirmations, migrations and secure deployment are implemented on `main`.
 
 ## Verification
 
-- Full suite after independent review fixes: `146 passed`.
+- Full suite after independent review fixes: `150 passed`.
 - `ruff check src tests scripts`: passed.
 - `ruff format --check src tests scripts`: passed.
 - `docker compose config --quiet`: passed.
@@ -42,8 +42,8 @@ confirmations, migrations and secure deployment are implemented on `main`.
   credits.
 
 Independent review additionally verified and hardened atomic pending-action claims on SQLite,
-single-active-conversation enforcement, bounded incremental compaction, and owner-scoped conference
-mutations/listing.
+restart/cancellation recovery, single-active-conversation enforcement, bounded incremental
+compaction and memory retrieval, and owner-scoped conference mutations/listing/reminders.
 
 ## Operator next steps
 
