@@ -19,8 +19,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from conference_scout.db.base import Base, TimestampMixin, utc_now
 from conference_scout.schemas.common import (
     ConferenceStatus,
+    ConversationStatus,
     DeadlineType,
     FeedbackDecision,
+    KnowledgeRelationKind,
+    MemoryKind,
+    MemoryScope,
+    PendingActionStatus,
     SourceType,
 )
 
@@ -155,6 +160,110 @@ class ConferenceFeedback(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     conference_id: Mapped[int] = mapped_column(ForeignKey("conferences.id", ondelete="CASCADE"))
     decision: Mapped[FeedbackDecision] = mapped_column(Enum(FeedbackDecision))
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class ModelSelection(TimestampMixin, Base):
+    __tablename__ = "model_selections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    profile_id: Mapped[str] = mapped_column(String(100))
+    model_name: Mapped[str] = mapped_column(String(300))
+
+
+class ModelCapability(Base):
+    __tablename__ = "model_capabilities"
+    __table_args__ = (UniqueConstraint("profile_id", "model_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[str] = mapped_column(String(100), index=True)
+    model_name: Mapped[str] = mapped_column(String(300))
+    supports_tools: Mapped[bool] = mapped_column(Boolean)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Conversation(TimestampMixin, Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[ConversationStatus] = mapped_column(
+        Enum(ConversationStatus), default=ConversationStatus.ACTIVE, index=True
+    )
+    summary: Mapped[str] = mapped_column(Text, default="")
+
+
+class ChatMessageRecord(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    domain_references: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class UserMemory(TimestampMixin, Base):
+    __tablename__ = "user_memories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[MemoryKind] = mapped_column(Enum(MemoryKind), index=True)
+    scope: Mapped[MemoryScope] = mapped_column(Enum(MemoryScope), index=True)
+    original_text: Mapped[str] = mapped_column(Text)
+    structured_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    topic_id: Mapped[int | None] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"))
+    conference_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conferences.id", ondelete="CASCADE")
+    )
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class PendingAction(TimestampMixin, Base):
+    __tablename__ = "pending_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    action_type: Mapped[str] = mapped_column(String(100), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    summary: Mapped[str] = mapped_column(Text)
+    status: Mapped[PendingActionStatus] = mapped_column(
+        Enum(PendingActionStatus), default=PendingActionStatus.PENDING, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class KnowledgeRelation(Base):
+    __tablename__ = "knowledge_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "source_type",
+            "source_id",
+            "relation_type",
+            "target_type",
+            "target_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    source_type: Mapped[str] = mapped_column(String(50), index=True)
+    source_id: Mapped[int] = mapped_column(index=True)
+    relation_type: Mapped[KnowledgeRelationKind] = mapped_column(
+        Enum(KnowledgeRelationKind), index=True
+    )
+    target_type: Mapped[str] = mapped_column(String(50), index=True)
+    target_id: Mapped[int] = mapped_column(index=True)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
 
 
