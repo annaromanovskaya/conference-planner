@@ -1,74 +1,50 @@
-# Conference Scout Progress
+# ConfPlanner Progress
 
-Last updated: 2026-09-05
+Last updated: 2026-10-13
 
 ## Current stage
 
-Implementation, application composition, deployment files, and documentation are complete.
-Docker runtime verification is blocked because Docker is unavailable in the current WSL environment.
+Conversational agent, persistent memory, internal MCP, Ollama/local model selection, Telegram
+confirmations, migrations and secure deployment are implemented on `main`.
 
 ## Completed
 
-- Read and analyzed `TASK.md`.
-- Chose a modular async monolith with a separate internal SearXNG container.
-- Confirmed a strictly personal, single-owner deployment model.
-- Agreed on deterministic discovery, deadline provenance, monitoring, reminders, security, testing, and deployment boundaries.
-- Saved the approved design in `docs/superpowers/specs/2026-09-05-conference-scout-design.md`.
-- Saved the executable plan in `docs/superpowers/plans/2026-09-05-conference-scout-implementation.md`.
-- Added Python 3.12 packaging, validated environment configuration, and secret-safe examples.
-- Added strict Pydantic schemas and enums for topics, conferences, deadlines, relevance, and search results.
-- Added the complete SQLAlchemy SQLite entity model, async session setup, owner bootstrap, and core repositories.
-- Verified database-level duplicate reminder protection and transactional deadline history behavior.
-- Added deterministic query generation for event types, years, and trusted domains.
-- Added URL normalization and SSRF rejection for unsafe schemes, credentials, and non-public IP addresses.
-- Added bounded HTML-to-text parsing that removes active and navigation content.
-- Added conservative deterministic conference identity matching.
-- Added the provider-neutral search protocol and SearXNG JSON adapter with malformed-response handling.
-- Added a bounded HTML fetcher with content-type checks and redirect revalidation.
-- Added the `LLMProvider` protocol, OpenRouter adapter, prompt-injection boundary, structured extraction validation, and bounded retries.
-- Added topic normalization and relevance scoring with validated structured responses.
-- Added discovery orchestration with per-query/per-candidate isolation, trusted domain/page use,
-  provenance verification, relevance thresholding, and SQLite persistence.
-- Added deterministic reminder offset calculation and a reminder processing service that records
-  only successful deliveries and suppresses repeats.
-- Added stable APScheduler weekly/daily/hourly jobs with coalescing and single-instance limits.
-- Added SQLite-backed reminder candidate selection for tracked subscriptions and persisted duplicate checks.
-- Added daily monitoring of official/deadline URLs with transactional current-date updates, history rows,
-  source verification, and post-commit change DTOs for Telegram notification.
-- Added owner-only Telegram middleware that rejects other IDs without exposing configuration.
-- Added Russian main menu, topic normalization preview/confirmation, trusted source input and controls,
-  manual discovery, conference grouping/tracking/archive actions, and upcoming deadline output.
-- Added repository-backed topic, trusted-source, and conference tracking operations.
-- Added the composition root, per-update repository sessions, scheduled job wiring, graceful shutdown,
-  and SQLite-only healthcheck.
-- Added a non-root multi-stage Dockerfile, hardened Compose services, internal SearXNG JSON config,
-  `.dockerignore`, GitHub-ready README, and MIT license.
-
-## Remaining
-
-- Run `docker compose config` and `docker build -t conference-scout:test .` on a host with Docker.
+- Replaced the runtime dependency on OpenRouter with provider-neutral Ollama Cloud, local Ollama,
+  and local OpenAI-compatible gateways.
+- Added persisted profile/model selection and tool-calling capability checks.
+- Added Alembic migration support for fresh and legacy SQLite databases without destructive schema
+  replacement.
+- Added persisted conversations, compact summaries, scoped user memories, provenance and an SQL
+  knowledge-graph projection.
+- Added seven validated pending-action types with owner binding, expiry, cancellation, retryable
+  failure and exactly-once completed-state checks.
+- Added an internal loopback-only MCP v2 Streamable HTTP server with ten read tools and seven
+  proposal tools; no shell/filesystem/raw SQL/generic web authority is exposed.
+- Added a bounded agent runtime with schema validation, step/call/timeout/result limits and safe
+  provider/tool error normalization.
+- Made ordinary Telegram text the primary AI chat; added `/model`, `/new`, `/memory`, `/forget`
+  and generalized confirmation callbacks.
+- Wired migrations, gateways, MCP, Telegram, scheduler and graceful reverse-order shutdown into one
+  async process.
+- Updated Docker deployment for host-local model access without publishing MCP or SearXNG ports.
+- Added an explicit opt-in model smoke command that is excluded from automated tests.
 
 ## Verification
 
-- `pytest -q`: 12 passed.
-- `ruff check src tests`: passed after formatting.
-- Focused search/web/deduplication suite: 13 passed.
-- Expanded search/web/AI/deduplication suite: 20 passed.
-- Full unit and discovery integration suite: 37 passed; Ruff passed.
-- Focused reminder/scheduler suite: 8 passed; Ruff passed.
-- Full suite after monitoring/reminders: 47 passed; Ruff format/check passed.
-- Full suite after Telegram UX: 56 passed; Ruff passed.
-- Final local suite: 62 passed; Ruff format/check passed.
-- `uv build`: source distribution and wheel built successfully.
-- Application/healthcheck imports: passed.
-- Secret scan: no token/API-key patterns found; `.env`, virtualenvs, and databases are ignored.
-- Docker verification attempted but could not start: `docker` is not installed/enabled in this WSL distro.
-- Async SQLite tests require execution outside the restricted development sandbox because `aiosqlite` uses worker threads; this does not affect the container runtime.
+- Full suite after Task 10: `142 passed`.
+- `ruff check src tests scripts`: passed.
+- `ruff format --check src tests scripts`: passed.
+- `docker compose config --quiet`: passed.
+- `uv build --offline`: wheel and source distribution built.
+- `docker build -t conference-scout:agent-test .`: image built successfully.
+- Secret scan: no credential value found; matches were only the scan patterns in plan/tests.
+- Real cloud/local model smoke: intentionally not run; it requires operator approval and may consume
+  credits.
 
-## Latest major commit
+## Operator next steps
 
-`d7d8f85 feat: add personal Telegram bot interface` (deployment commit pending).
-
-## Uncommitted work
-
-- Final deployment/documentation stage, ready for its major commit.
+1. Copy `.env.example` to `.env` and configure Telegram plus at least one model profile.
+2. Start with `docker compose up -d`.
+3. Open the bot, run `/model`, choose a currently available model, then send ordinary text.
+4. Optionally run `scripts/smoke_model.py` explicitly if spending a model request is acceptable.
+5. Back up `/data/conference_scout.db` before upgrades.

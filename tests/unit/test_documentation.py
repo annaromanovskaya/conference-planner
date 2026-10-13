@@ -12,7 +12,10 @@ def test_readme_contains_required_operator_sections() -> None:
         "Requirements",
         "Quick start",
         "Telegram bot creation",
-        "OpenRouter configuration",
+        "Ollama and local model configuration",
+        "Telegram commands",
+        "Memory and confirmations",
+        "Model smoke check",
         "SearXNG",
         "Configuration",
         "Docker deployment",
@@ -31,6 +34,10 @@ def test_readme_contains_required_operator_sections() -> None:
         assert f"## {heading}" in readme
     assert "docker compose up -d" in readme
     assert "/data/conference_scout.db" in readme
+    assert "host.docker.internal" in readme
+    assert "Free usage credits" in readme
+    assert "ordinary text" in readme
+    assert "OpenRouter" not in readme
 
 
 def test_example_environment_contains_no_real_secrets() -> None:

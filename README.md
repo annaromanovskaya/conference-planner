@@ -1,90 +1,211 @@
-# Conference Scout
+# ConfPlanner
 
-Conference Scout is a personal, self-hosted Telegram bot that discovers scientific events from real web sources, tracks their dates, and warns its owner when a deadline approaches or changes. One deployment serves one Telegram owner; every other user deploys an independent instance.
+ConfPlanner — персональный self-hosted Telegram-агент для поиска научных конференций,
+контроля дедлайнов и заметок владельца. Один deployment обслуживает одного владельца;
+сообщения остальных пользователей отклоняются до запуска обработчиков.
 
 ## Features
 
-- LLM-assisted topic normalization and relevance scoring through OpenRouter.
-- Deterministic current/next-year queries through a private SearXNG container.
-- Trusted domains and catalog pages.
-- Source-backed extraction, deadline provenance, conservative deduplication, tracking and archives.
-- Weekly discovery, daily monitoring, hourly reminders, and deadline-change history.
-- Owner-only Telegram access and persistent SQLite storage.
+- Сам Telegram-бот является AI-чатом: ordinary text сразу получает ответ агента, отдельной
+  кнопки «AI-чат» нет.
+- Ollama Cloud, локальный Ollama и локальный OpenAI-compatible API с выбором модели через
+  `/model` без перезапуска.
+- Ограниченный agent loop с внутренним MCP v2, памятью диалога и SQL-графом знаний.
+- Пользовательские заметки и правила: например, «эта конференция приоритетная» или
+  «не предлагай мероприятия в США».
+- Любое агентское изменение сначала становится expiring pending action и выполняется только
+  после подтверждения владельцем в Telegram.
+- Поиск через внутренний SearXNG, SSRF-safe загрузка страниц, provenance дедлайнов,
+  дедупликация, мониторинг и напоминания.
 
 ## Architecture
 
-An async Python modular monolith runs aiogram long polling and APScheduler. SQLAlchemy/aiosqlite store state in `/data/conference_scout.db`. Protocol boundaries isolate OpenRouter, SearXNG, and page retrieval. SearXNG is a second internal-only Compose service.
+Один async Python-процесс запускает aiogram polling, APScheduler и MCP Streamable HTTP на
+`127.0.0.1`. MCP-порт не публикуется Docker Compose. SQLite остаётся источником истины для
+конференций, связей, истории чата, памяти, выбранной модели и pending actions. SearXNG работает
+вторым внутренним сервисом. Модель не получает shell, filesystem, raw SQL, secrets,
+произвольный fetch URL или unrestricted web tool.
 
 ## How it works
 
-Topics become validated keywords. Python generates queries, SearXNG returns real URLs, the SSRF-safe fetcher retrieves bounded HTML, and OpenRouter extracts only facts present in the page. Pydantic validates output before deterministic verification, deduplication, relevance filtering, and persistence. The LLM never acts as a conference or date source.
+Агент собирает системную политику, релевантную память, summary и последние сообщения. Модель
+может ответить сразу либо вызвать один из строго описанных MCP-инструментов. Аргументы проходят
+JSON Schema validation. Чтение выполняется сразу; `propose_*` лишь создаёт pending action.
+Подтверждение вызывает детерминированный Python-сервис ровно один раз. Turn ограничен числом
+шагов, tool calls, размером контекста/результатов и общим timeout.
+
+Поиск конференций остаётся source-backed: Python строит запросы, SearXNG возвращает реальные
+URL, безопасный fetcher получает ограниченный HTML, а модель извлекает только факты страницы.
+Pydantic валидирует структурированный ответ. Ollama Cloud не гарантирует provider-enforced
+structured output, поэтому в приложении сохранены validation и bounded retries.
 
 ## Requirements
 
-Docker Engine with Compose v2, a Telegram bot token, the owner's numeric Telegram ID, and an OpenRouter API key/model. Local development requires Python 3.12+ and `uv`.
+- Docker Engine и Compose v2;
+- Telegram bot token и numeric Telegram ID владельца;
+- хотя бы один model profile: Ollama Cloud key, локальный Ollama или локальный
+  OpenAI-compatible endpoint;
+- для разработки: Python 3.12+ и `uv`.
 
 ## Quick start
 
 ```bash
-git clone YOUR_REPOSITORY_URL conference-scout
-cd conference-scout
+git clone YOUR_REPOSITORY_URL ConfPlanner
+cd ConfPlanner
 cp .env.example .env
-# edit .env
+# заполните TELEGRAM_BOT_TOKEN, OWNER_TELEGRAM_ID и model profile
 docker compose up -d
 docker compose logs -f conference-scout
 ```
 
+При старте Alembic автоматически обновляет свежую или известную legacy-базу без удаления
+существующих тем, конференций, источников и истории.
+
 ## Telegram bot creation
 
-Create a bot with Telegram's `@BotFather`, place its token in `TELEGRAM_BOT_TOKEN`, and put your numeric account ID in `OWNER_TELEGRAM_ID`. Messages from every other account are rejected before handlers run.
+Создайте бота через `@BotFather`, запишите token в `TELEGRAM_BOT_TOKEN`, а свой numeric ID —
+в `OWNER_TELEGRAM_ID`. Не отправляйте token или model API key в чат бота.
 
-## OpenRouter configuration
+## Ollama and local model configuration
 
-Set `OPENROUTER_API_KEY` and any compatible `OPENROUTER_MODEL`. The code does not pin a model. Model output is retried only a bounded number of times and must pass Pydantic validation.
+### Ollama Cloud
+
+```dotenv
+OLLAMA_CLOUD_BASE_URL=https://ollama.com
+OLLAMA_CLOUD_API_KEY=YOUR_OLLAMA_CLOUD_API_KEY
+```
+
+Cloud показывает только пересечение ответа `/api/tags` и настроенного allowlist. Free usage credits
+can be used with указанными в `.env.example` моделями; доступность и условия тарифа
+могут измениться на стороне Ollama. Добавление платных credits не выполняется приложением.
+
+### Локальный Ollama
+
+Запустите Ollama на host и разрешите соединение с контейнера. В Compose Linux-host доступен как
+`host.docker.internal` благодаря mapping `host-gateway`:
+
+```dotenv
+OLLAMA_LOCAL_BASE_URL=http://host.docker.internal:11434
+OLLAMA_LOCAL_API_KEY=
+```
+
+При запуске без Docker обычно используйте `http://127.0.0.1:11434`. Если ваш endpoint защищён,
+задайте `OLLAMA_LOCAL_API_KEY`.
+
+### Local OpenAI-compatible API
+
+```dotenv
+LOCAL_OPENAI_BASE_URL=http://host.docker.internal:8000
+LOCAL_OPENAI_API_KEY=
+```
+
+Подойдут серверы, реализующие `/v1/models` и `/v1/chat/completions`. Ключ опционален. Профиль
+скрыт из `/model`, пока URL не настроен.
+
+## Telegram commands
+
+- `/start` — краткая справка; после неё просто пишите запросы обычным текстом;
+- `/model` — выбрать profile/model и проверить tool-calling capability;
+- `/new` — начать новый диалог, не удаляя долгосрочную память;
+- `/memory` — показать активные заметки и правила;
+- `/forget ID` — предложить удалить запись памяти с подтверждением;
+- `/help` — подсказка по командам.
+
+Модель без tool calling остаётся доступной с пометкой «только чат». Исчезнувшая из API модель
+не выбирается повторно; выполните `/model` и выберите актуальную.
+
+## Memory and confirmations
+
+История диалога хранится в SQLite и при росте заменяется безопасным summary. Долгосрочная память
+хранит исходный текст, валидированное правило, scope (`GLOBAL`, `TOPIC`, `CONFERENCE`) и
+provenance. SQL knowledge graph проецирует связи тем, конференций, дедлайнов, источников,
+подписок и заметок без отдельной graph DB.
+
+Добавление темы/источника, tracking/archive, сохранение/удаление памяти и discovery требуют
+кнопки «Подтвердить». Просроченное, отменённое, чужое или уже выполненное действие не исполняется.
+
+## Model smoke check
+
+Smoke-команда делает реальный запрос и может расходовать Cloud credits, поэтому обычные тесты её
+не запускают. Выполняйте только явно:
+
+```bash
+uv run python scripts/smoke_model.py --profile ollama-local --model llama3.2
+uv run python scripts/smoke_model.py --profile ollama-cloud --model gpt-oss:20b
+```
+
+Profile IDs: `ollama-cloud`, `ollama-local`, `openai-local`. Команда проверяет список моделей и
+один harmless tool call, но никогда не печатает ключ или upstream response body.
 
 ## SearXNG
 
-Compose starts SearXNG without a host port and enables JSON search. The application reaches it at `http://searxng:8080`; public page SSRF rules do not apply to this explicitly configured internal integration.
+Compose запускает SearXNG без host-порта. Приложение обращается к нему по
+`http://searxng:8080`. Внешние страницы остаются недоверенными данными и не могут менять policy
+или список инструментов агента.
 
 ## Configuration
 
-All settings are environment variables documented in `.env.example`. `DISCOVERY_DAY` and `DISCOVERY_HOUR` schedule weekly discovery, `MONITORING_HOUR` schedules monitoring, `REMINDER_DAYS` is a comma-separated positive list, `MIN_RELEVANCE_SCORE` is between 0 and 1, and `APP_TIMEZONE` is an IANA timezone. Restart after configuration changes.
+Все переменные перечислены в `.env.example`. Основные лимиты: `AGENT_MAX_STEPS`,
+`AGENT_MAX_TOOL_CALLS_PER_STEP`, `AGENT_TIMEOUT_SECONDS`, `AGENT_MAX_CONTEXT_CHARS` и
+`AGENT_MAX_TOOL_RESULT_CHARS`. MCP должен оставаться на `MCP_HOST=127.0.0.1`. Изменения `.env`
+требуют рестарта контейнера; выбор через `/model` сохраняется без рестарта.
 
 ## Docker deployment
 
-Run `docker compose up -d`. The application uses long polling and publishes no inbound port. It runs non-root with a read-only root filesystem, dropped capabilities, `no-new-privileges`, writable `/data`, and tmpfs `/tmp`. Both services use `restart: unless-stopped`.
+```bash
+docker compose up -d
+docker compose ps
+docker compose logs -f conference-scout
+```
+
+Приложение использует long polling и не публикует входных портов. Контейнер работает non-root,
+с read-only root filesystem, dropped capabilities, `no-new-privileges`, writable `/data` и
+tmpfs `/tmp`. Ни MCP, ни SearXNG наружу не опубликованы.
 
 ## Trusted sources
 
-Add `DOMAIN example.org` to generate additional `site:` queries, or `PAGE https://example.org/events` to check a catalog directly. Trusted does not mean official: secondary dates remain visibly unverified.
+`DOMAIN example.org` добавляет `site:`-ограничение, а `PAGE https://example.org/events` — каталог
+для проверки. Trusted не означает official: вторичные даты сохраняются с соответствующим
+provenance и verification flag.
 
 ## Topics
 
-Choose “Мои темы”, add natural-language scientific interests, inspect the generated canonical name/description/keywords, then confirm. Nothing is saved before confirmation.
+Темы можно добавить разговором с агентом или старым shortcut «Мои темы». Каноническое имя,
+описание и keywords валидируются, а запись появляется только после подтверждения.
 
 ## Discovery
 
-Choose “Найти конференции” for an immediate run. Scheduled discovery covers the current and following calendar year. Errors are isolated per query and candidate.
+Попросите агента найти конференции или нажмите shortcut «Найти конференции». Агент предложит
+запуск за конкретные годы; scheduled discovery проверяет текущий и следующий календарный год.
+Ошибки изолируются на уровне query и candidate.
 
 ## Deadline tracking
 
-Track a discovered conference to enable daily monitoring and reminders. Each deadline stores its source URL and verification flag. Date changes update the current record and append history in one transaction; reminders use Python calendar arithmetic and a database uniqueness constraint.
+Tracking включает ежедневный monitoring и reminders. Дедлайн хранит source URL и verification
+flag. Изменение даты обновляет текущее значение и добавляет deadline history.
 
 ## Backups
 
-Stop the application or use SQLite's online backup command, then copy `/data/conference_scout.db` from the `conference_data` volume. Example:
+Перед файловой копией остановите writer:
 
 ```bash
 docker compose stop conference-scout
-docker compose run --rm --entrypoint sh conference-scout -c 'cp /data/conference_scout.db /tmp/conference_scout.db'
+docker run --rm -v confplanner_conference_data:/data -v "$PWD":/backup alpine \
+  cp /data/conference_scout.db /backup/conference_scout.db
 docker compose start conference-scout
 ```
 
-For practical host backups, mount a host directory at `/data` instead of the named volume and copy the database while the service is stopped. Restore by replacing the database before startup.
+Имя volume уточните через `docker volume ls`. Для восстановления остановите сервис, замените
+`/data/conference_scout.db`, сохраните владельца/права и снова запустите приложение. Всегда
+проверяйте backup отдельно до обновления.
 
 ## Security
 
-Secrets live only in ignored `.env`; never commit it. Telegram access is restricted to `OWNER_TELEGRAM_ID`. Containers are non-privileged, have no Docker socket or host networking, and expose no ports. Search and user URLs are untrusted: only HTTP(S) public destinations are fetched, DNS and redirects are checked, and private/loopback/link-local/metadata addresses are rejected. External HTML is untrusted data, not instructions; prompts explicitly ignore instructions embedded in pages.
+Secrets находятся только в ignored `.env`, не сохраняются в БД, prompts, MCP results или
+Telegram errors. Не коммитьте `.env`. Fetcher разрешает лишь HTTP(S) public destinations,
+проверяет DNS/redirects и блокирует private, loopback, link-local и metadata addresses. MCP
+доступен только внутри container loopback. Healthcheck выполняет только `SELECT 1` и не вызывает
+модель, поэтому не расходует credits.
 
 ## Development
 
@@ -93,26 +214,29 @@ uv sync --python 3.12 --extra dev
 uv run ruff format .
 uv run ruff check .
 uv run pytest -q
+docker compose config --quiet
 ```
 
-SQLite integration tests may require normal thread permissions because aiosqlite uses a worker thread.
+SQLite async tests могут требовать обычных thread permissions из-за worker thread `aiosqlite`.
 
 ## Testing
 
-Tests use fake search/fetch/LLM/Telegram boundaries and temporary SQLite databases; they require no credentials or internet. Unit tests cover configuration, validation, queries, SSRF, parsing, deduplication, relevance, access control, reminders and scheduling. Integration tests cover discovery persistence and deadline history.
+Обычный suite использует fake model/search/fetch/Telegram boundaries и временные SQLite-базы —
+credentials, интернет и credits не нужны. Integration tests покрывают Alembic compatibility,
+discovery, monitoring, MCP handshake и model→tool→confirmation→domain flow.
 
 ## Limitations
 
-JavaScript-only pages are not rendered. Date-only deadlines have no source timezone. Extraction quality depends on the selected model. Initial schema creation is automatic; production schema migrations are a future addition. This is intentionally a personal single-owner service.
+JavaScript-only страницы не рендерятся. Качество extraction зависит от модели. Локальный endpoint
+должен быть доступен контейнеру и иметь достаточную RAM/VRAM. Это намеренно single-owner service;
+MCP не является публичным multi-tenant API.
 
 ## Roadmap
 
-- Alembic migrations and richer Telegram cards/actions.
-- Optional browser fetcher for JavaScript-only sites.
-- Conference-series modeling and wider configurable search windows.
-- Optional additional LLM/search providers behind existing protocols.
+- Optional browser fetcher для JavaScript-only сайтов.
+- Улучшенное моделирование conference series и повторяющихся событий.
+- Более точный semantic retrieval поверх текущего SQL source of truth.
 
 ## License
 
-MIT. See `LICENSE`.
-
+MIT. См. `LICENSE`.
