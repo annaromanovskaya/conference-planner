@@ -95,7 +95,7 @@ OLLAMA_LOCAL_API_KEY=
 ### Local OpenAI-compatible API
 
 ```dotenv
-LOCAL_OPENAI_BASE_URL=http://host.docker.internal:8000
+LOCAL_OPENAI_BASE_URL=http://host.docker.internal:8000/v1
 LOCAL_OPENAI_API_KEY=
 ```
 

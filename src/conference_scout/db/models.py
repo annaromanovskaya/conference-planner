@@ -10,9 +10,11 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -187,6 +189,14 @@ class ModelCapability(Base):
 
 class Conversation(TimestampMixin, Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index(
+            "uq_conversations_active_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("status = 'ACTIVE'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)

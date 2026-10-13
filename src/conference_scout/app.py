@@ -287,11 +287,15 @@ def _build_action_executors(
         return "Источник добавлен."
 
     async def track(user_id: int, payload: TrackConferenceAction) -> str:
-        await ConferenceRepository(session).track(user_id, payload.conference_id)
+        repository = ConferenceRepository(session)
+        await repository.require_accessible(user_id, payload.conference_id)
+        await repository.track(user_id, payload.conference_id)
         return "Конференция отслеживается."
 
-    async def archive(_user_id: int, payload: ArchiveConferenceAction) -> str:
-        await ConferenceRepository(session).archive(payload.conference_id)
+    async def archive(user_id: int, payload: ArchiveConferenceAction) -> str:
+        repository = ConferenceRepository(session)
+        await repository.require_accessible(user_id, payload.conference_id)
+        await repository.archive(payload.conference_id)
         return "Конференция перемещена в архив."
 
     async def save_memory(user_id: int, payload: SaveMemoryAction) -> str:

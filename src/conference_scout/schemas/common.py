@@ -42,6 +42,7 @@ class MemoryScope(StrEnum):
 
 class PendingActionStatus(StrEnum):
     PENDING = "PENDING"
+    EXECUTING = "EXECUTING"
     EXECUTED = "EXECUTED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"

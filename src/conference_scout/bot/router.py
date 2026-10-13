@@ -156,7 +156,9 @@ def build_router(*, owner_telegram_id: int) -> Router:
             (ConferenceStatus.DISCOVERED, "Найденные"),
             (ConferenceStatus.ARCHIVED, "Архив"),
         ):
-            values = await conference_repository.list_by_status(status)
+            values = await conference_repository.list_accessible_by_status(
+                conference_repository.owner_user_id, status
+            )
             lines = "\n".join(f"• {escape(item.name)} (ID {item.id})" for item in values) or "—"
             blocks.append(f"<b>{title}</b>\n{lines}")
         await message.answer("\n\n".join(blocks), parse_mode="HTML")

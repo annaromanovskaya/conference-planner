@@ -1,8 +1,9 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conference_scout.agent.actions import ActionUnavailable, ConfirmationService
 from conference_scout.db.repositories.pending_actions import PendingActionRepository
@@ -183,3 +184,68 @@ async def test_executor_failure_rolls_back_and_remains_retryable(session: AsyncS
     assert loaded is not None and loaded.status == PendingActionStatus.FAILED
     assert loaded.error == "action execution failed"
     assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_claimed_action_cannot_be_executed_by_duplicate_callback(
+    session: AsyncSession,
+) -> None:
+    owner_id, _ = await _users(session)
+    calls = []
+
+    async def execute(_user_id: int, _payload) -> str:
+        calls.append(1)
+        return "done"
+
+    repository = PendingActionRepository(session)
+    action = await repository.create(
+        owner_id,
+        action_type="track_conference",
+        payload={"action": "track_conference", "conference_id": 1},
+        summary="tracking",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    action.status = PendingActionStatus.EXECUTING
+    await session.commit()
+
+    with pytest.raises(ActionUnavailable, match="already being processed"):
+        await ConfirmationService(session, executors={"track_conference": execute}).confirm(
+            owner_id, action.id
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_confirmations_claim_action_once(session: AsyncSession) -> None:
+    owner_id, _ = await _users(session)
+    action = await PendingActionRepository(session).create(
+        owner_id,
+        action_type="track_conference",
+        payload={"action": "track_conference", "conference_id": 1},
+        summary="tracking",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    await session.commit()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def execute(_user_id: int, _payload) -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return "done"
+
+    factory = async_sessionmaker(session.bind, expire_on_commit=False)
+    async with factory() as first, factory() as duplicate:
+        first_service = ConfirmationService(first, executors={"track_conference": execute})
+        duplicate_service = ConfirmationService(duplicate, executors={"track_conference": execute})
+        first_task = asyncio.create_task(first_service.confirm(owner_id, action.id))
+        await started.wait()
+        with pytest.raises(ActionUnavailable, match="already being processed"):
+            await duplicate_service.confirm(owner_id, action.id)
+        release.set()
+        await first_task
+
+    assert calls == 1

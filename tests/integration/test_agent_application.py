@@ -9,7 +9,7 @@ from conference_scout.agent.runtime import AgentRuntime
 from conference_scout.ai.models import AvailableModel, ChatResponse, ToolCall
 from conference_scout.ai.registry import ModelRegistry
 from conference_scout.app import _build_action_executors
-from conference_scout.db.models import Conference
+from conference_scout.db.models import Conference, ConferenceTopic, Topic
 from conference_scout.db.repositories.agent_state import AgentStateRepository
 from conference_scout.db.repositories.conferences import ConferenceRepository
 from conference_scout.db.repositories.users import UserRepository
@@ -17,6 +17,7 @@ from conference_scout.mcp.client import InProcessToolClient
 from conference_scout.mcp.lifecycle import MCPServerLifecycle
 from conference_scout.mcp.server import build_mcp_server
 from conference_scout.mcp.tools import MCPToolServices
+from conference_scout.schemas.agent import ArchiveConferenceAction
 from conference_scout.schemas.common import ConferenceStatus
 
 
@@ -57,16 +58,26 @@ async def test_selected_model_to_mcp_proposal_to_confirmed_domain_action(session
     session.add(conference)
     await session.flush()
     assert conference.id == 1
+    topic = Topic(
+        user_id=user.id,
+        name="Astronomy",
+        description="Stars",
+        keywords=["astronomy"],
+        enabled=True,
+    )
+    session.add(topic)
+    await session.flush()
+    session.add(
+        ConferenceTopic(conference_id=conference.id, topic_id=topic.id, relevance_score=1.0)
+    )
 
     gateway = Gateway()
     state = AgentStateRepository(session)
     registry = ModelRegistry.for_testing(state, local_gateway=gateway)
     await registry.select(user.id, "ollama-local", "local-model")
     await state.set_capability("ollama-local", "local-model", True)
-    confirmation = ConfirmationService(
-        session,
-        executors=_build_action_executors(session, user.id, None, None, None, None),
-    )
+    executors = _build_action_executors(session, user.id, None, None, None, None)
+    confirmation = ConfirmationService(session, executors=executors)
     tool_client = InProcessToolClient(
         build_mcp_server(
             MCPToolServices(
@@ -92,6 +103,14 @@ async def test_selected_model_to_mcp_proposal_to_confirmed_domain_action(session
     tracked = await ConferenceRepository(session).list_by_status(ConferenceStatus.TRACKING)
     assert result.success is True
     assert [item.id for item in tracked] == [conference.id]
+
+    foreign = Conference(name="Foreign", normalized_name="foreign")
+    session.add(foreign)
+    await session.flush()
+    with pytest.raises(ValueError, match="not found"):
+        await executors["archive_conference"](
+            user.id, ArchiveConferenceAction(conference_id=foreign.id)
+        )
 
 
 @pytest.mark.asyncio

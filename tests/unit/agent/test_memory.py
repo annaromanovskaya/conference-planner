@@ -71,7 +71,38 @@ async def test_compaction_summarizes_only_visible_user_and_assistant_text(
     assert changed is True
     assert captured == [("", "user: visible question\nassistant: visible answer")]
     assert "top-secret" not in captured[0][1]
-    assert context.summary == "User asked a visible question and received an answer."
+    assert len(context.summary) <= 10
+    assert context.summary.endswith("an answer.")
+
+
+@pytest.mark.asyncio
+async def test_compaction_removes_summarized_text_but_keeps_domain_references(
+    session: AsyncSession,
+) -> None:
+    owner_id = await _owner_id(session)
+    service = MemoryService(session, max_context_chars=20)
+    await service.append_message(owner_id, "user", "first long question")
+    await service.append_message(
+        owner_id,
+        "assistant",
+        "first long answer",
+        domain_references=[{"kind": "conference", "id": 9, "position": 1}],
+    )
+    transcripts = []
+
+    async def summarize(previous: str, transcript: str) -> str:
+        transcripts.append((previous, transcript))
+        return "bounded summary"
+
+    assert await service.compact_conversation(owner_id, summarize) is True
+    context = await service.get_context(owner_id, "")
+    assert [message.content for message in context.messages] == [""]
+    assert context.messages[0].domain_references[0].id == 9
+
+    await service.append_message(owner_id, "user", "second very long question")
+    assert await service.compact_conversation(owner_id, summarize) is True
+    assert "first long question" not in transcripts[1][1]
+    assert "second very long question" in transcripts[1][1]
 
 
 @pytest.mark.asyncio

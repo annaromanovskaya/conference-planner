@@ -31,7 +31,7 @@ confirmations, migrations and secure deployment are implemented on `main`.
 
 ## Verification
 
-- Full suite after Task 10: `142 passed`.
+- Full suite after independent review fixes: `146 passed`.
 - `ruff check src tests scripts`: passed.
 - `ruff format --check src tests scripts`: passed.
 - `docker compose config --quiet`: passed.
@@ -40,6 +40,10 @@ confirmations, migrations and secure deployment are implemented on `main`.
 - Secret scan: no credential value found; matches were only the scan patterns in plan/tests.
 - Real cloud/local model smoke: intentionally not run; it requires operator approval and may consume
   credits.
+
+Independent review additionally verified and hardened atomic pending-action claims on SQLite,
+single-active-conversation enforcement, bounded incremental compaction, and owner-scoped conference
+mutations/listing.
 
 ## Operator next steps
 

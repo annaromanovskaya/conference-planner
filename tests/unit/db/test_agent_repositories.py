@@ -1,10 +1,12 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conference_scout.db.models import ModelSelection
+from conference_scout.db.models import Conversation, ModelSelection
 from conference_scout.db.repositories.agent_state import AgentStateRepository
 from conference_scout.db.repositories.conversations import ConversationRepository
 from conference_scout.db.repositories.memories import KnowledgeRelationRepository, MemoryRepository
@@ -83,6 +85,38 @@ async def test_conversation_messages_are_ordered_and_owner_scoped(session: Async
     assert replacement.id != first.id
     assert first.status == ConversationStatus.CLOSED
     assert replacement.status == ConversationStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_concurrent_get_or_create_keeps_one_active_conversation(
+    session: AsyncSession,
+) -> None:
+    first_id, _ = await _users(session)
+    await session.commit()
+    factory = async_sessionmaker(session.bind, expire_on_commit=False)
+
+    async with factory() as left, factory() as right:
+
+        async def create(repository, db_session):
+            conversation = await repository.get_or_create_active(first_id)
+            await db_session.commit()
+            return conversation
+
+        left_conversation, right_conversation = await asyncio.gather(
+            create(ConversationRepository(left), left),
+            create(ConversationRepository(right), right),
+        )
+
+    assert left_conversation.id == right_conversation.id
+    active = list(
+        await session.scalars(
+            select(Conversation).where(
+                Conversation.user_id == first_id,
+                Conversation.status == ConversationStatus.ACTIVE,
+            )
+        )
+    )
+    assert len(active) == 1
 
 
 @pytest.mark.asyncio

@@ -30,11 +30,12 @@ class MemoryService:
         records = await self.conversations.list_messages(user_id, conversation.id)
         selected = []
         used = 0
+        message_budget = max(0, self.max_context_chars - len(conversation.summary))
         for record in reversed(records):
             size = len(record.content)
-            if selected and used + size > self.max_context_chars:
+            if selected and used + size > message_budget:
                 break
-            if not selected or used + size <= self.max_context_chars:
+            if not selected or used + size <= message_budget:
                 selected.append(record)
                 used += size
         selected.reverse()
@@ -90,7 +91,20 @@ class MemoryService:
         if sum(len(record.content) for record in visible) <= self.max_context_chars:
             return False
         transcript = "\n".join(f"{record.role}: {record.content}" for record in visible)
-        conversation.summary = await summarizer(conversation.summary, transcript)
+        summary = await summarizer(conversation.summary, transcript)
+        summary_limit = max(1, self.max_context_chars // 2)
+        conversation.summary = summary[-summary_limit:]
+        references: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for record in records:
+            for reference in record.domain_references:
+                key = (str(reference.get("kind")), int(reference.get("id", 0)))
+                if key not in seen:
+                    seen.add(key)
+                    references.append(reference)
+        await self.conversations.replace_messages_with_reference_marker(
+            user_id, conversation.id, references
+        )
         await self.session.flush()
         return True
 

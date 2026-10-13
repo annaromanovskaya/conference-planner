@@ -2,7 +2,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conference_scout.db.models import PendingAction
@@ -60,6 +60,27 @@ class ConfirmationService:
             await self.session.commit()
             raise ActionUnavailable("action expired")
 
+        claimed = await self.session.execute(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.status.in_({PendingActionStatus.PENDING, PendingActionStatus.FAILED}),
+            )
+            .values(status=PendingActionStatus.EXECUTING, error=None)
+        )
+        if claimed.rowcount != 1:
+            await self.session.rollback()
+            current = await self._get_for_update(user_id, action_id)
+            if current is None:
+                raise ActionUnavailable("action not found")
+            self._ensure_available(current)
+            raise ActionUnavailable("action is already being processed")
+        await self.session.commit()
+        action = await self._get_for_update(user_id, action_id)
+        if action is None:
+            raise ActionUnavailable("action not found")
+
         try:
             payload = parse_action_payload(action.payload)
             if payload.action != action.action_type:
@@ -109,6 +130,7 @@ class ConfirmationService:
     def _ensure_available(action: PendingAction) -> None:
         messages = {
             PendingActionStatus.EXECUTED: "action already completed",
+            PendingActionStatus.EXECUTING: "action is already being processed",
             PendingActionStatus.CANCELLED: "action cancelled",
             PendingActionStatus.EXPIRED: "action expired",
         }
