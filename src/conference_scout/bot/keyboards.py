@@ -31,3 +31,25 @@ def add_buttons(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Добавить", callback_data=f"{kind}:add")]]
     )
+
+
+def action_confirmation(action_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data=f"action:confirm:{action_id}"
+                ),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"action:cancel:{action_id}"),
+            ]
+        ]
+    )
+
+
+def indexed_buttons(values: list[tuple[str, str]], *, prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=f"{prefix}:{index}")]
+            for index, (label, _value) in enumerate(values)
+        ]
+    )

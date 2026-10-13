@@ -6,8 +6,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from conference_scout.bot.access import OwnerOnlyMiddleware
+from conference_scout.bot.agent_router import build_agent_router
+from conference_scout.bot.confirmation_router import build_confirmation_router
 from conference_scout.bot.errors import ExternalErrorMiddleware
-from conference_scout.bot.keyboards import add_buttons, main_menu, topic_confirmation
+from conference_scout.bot.keyboards import (
+    action_confirmation,
+    add_buttons,
+    main_menu,
+    topic_confirmation,
+)
+from conference_scout.bot.model_router import build_model_router
 from conference_scout.bot.states import SourceFlow, TopicFlow
 from conference_scout.schemas.common import SourceType
 
@@ -22,7 +30,8 @@ def build_router(*, owner_telegram_id: int) -> Router:
     @router.message(CommandStart())
     async def start(message: Message) -> None:
         await message.answer(
-            "🔭 Conference Scout\n\nПерсональный поиск научных конференций.",
+            "🔭 Conference Planner\n\nЯ — ваш AI-агент по научным конференциям. "
+            "Просто напишите вопрос или задачу. /model — выбрать модель, /help — помощь.",
             reply_markup=main_menu(),
         )
 
@@ -51,16 +60,26 @@ def build_router(*, owner_telegram_id: int) -> Router:
         )
 
     @router.callback_query(F.data == "topic:save", TopicFlow.waiting_confirmation)
-    async def topic_save(callback: CallbackQuery, state: FSMContext, topic_repository) -> None:
-        from conference_scout.schemas.topics import TopicNormalization
+    async def topic_save(
+        callback: CallbackQuery,
+        state: FSMContext,
+        confirmation_service,
+        owner_user_id: int,
+    ) -> None:
+        from conference_scout.schemas.agent import AddTopicAction
 
         data = await state.get_data()
-        await topic_repository.create(
-            topic_repository.owner_user_id, TopicNormalization.model_validate(data["topic"])
+        topic = data["topic"]
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            AddTopicAction(
+                name=topic["name"],
+                description=topic.get("description", ""),
+                keywords=tuple(topic.get("keywords", ())),
+            ),
         )
-        await topic_repository.session.commit()
         await state.clear()
-        await callback.message.answer("✅ Тема сохранена.")
+        await callback.message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
         await callback.answer()
 
     @router.callback_query(F.data.in_({"topic:cancel", "topic:edit"}))
@@ -107,22 +126,25 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await callback.answer()
 
     @router.message(SourceFlow.waiting_value)
-    async def source_value(message: Message, state: FSMContext, source_repository) -> None:
+    async def source_value(
+        message: Message,
+        state: FSMContext,
+        confirmation_service,
+        owner_user_id: int,
+    ) -> None:
+        from conference_scout.schemas.agent import AddSourceAction
+
         kind, separator, value = (message.text or "").strip().partition(" ")
         if not separator or kind.upper() not in SourceType.__members__ or not value.strip():
             await message.answer("Формат: DOMAIN example.org или PAGE https://example.org/events")
             return
         source_type = SourceType[kind.upper()]
-        await source_repository.create(value.strip(), value.strip(), source_type)
-        await source_repository.session.commit()
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            AddSourceAction(source_type=source_type, value=value.strip()),
+        )
         await state.clear()
-        await message.answer("✅ Источник сохранён.")
-
-    @router.message(F.text == "Найти конференции")
-    async def discover(message: Message, discovery_runner) -> None:
-        await message.answer("🔎 Поиск запущен. Результат будет отправлен после завершения.")
-        report = await discovery_runner()
-        await message.answer(f"Найдено новых конференций: {len(report.created_ids)}")
+        await message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
 
     @router.message(F.text == "Конференции")
     async def conferences(message: Message, conference_repository) -> None:
@@ -140,18 +162,26 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await message.answer("\n\n".join(blocks), parse_mode="HTML")
 
     @router.callback_query(F.data.startswith("conference:track:"))
-    async def track(callback: CallbackQuery, conference_repository) -> None:
-        await conference_repository.track(
-            conference_repository.owner_user_id, int(callback.data.rsplit(":", 1)[1])
+    async def track(callback: CallbackQuery, confirmation_service, owner_user_id: int) -> None:
+        from conference_scout.schemas.agent import TrackConferenceAction
+
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            TrackConferenceAction(conference_id=int(callback.data.rsplit(":", 1)[1])),
         )
-        await conference_repository.session.commit()
-        await callback.answer("Конференция отслеживается")
+        await callback.message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
+        await callback.answer()
 
     @router.callback_query(F.data.startswith("conference:archive:"))
-    async def archive(callback: CallbackQuery, conference_repository) -> None:
-        await conference_repository.archive(int(callback.data.rsplit(":", 1)[1]))
-        await conference_repository.session.commit()
-        await callback.answer("Конференция перемещена в архив")
+    async def archive(callback: CallbackQuery, confirmation_service, owner_user_id: int) -> None:
+        from conference_scout.schemas.agent import ArchiveConferenceAction
+
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            ArchiveConferenceAction(conference_id=int(callback.data.rsplit(":", 1)[1])),
+        )
+        await callback.message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
+        await callback.answer()
 
     @router.message(F.text == "Ближайшие дедлайны")
     async def deadlines(message: Message, reminder_repository) -> None:
@@ -168,10 +198,18 @@ def build_router(*, owner_telegram_id: int) -> Router:
 
     @router.message(F.text == "Настройки")
     async def settings(message: Message) -> None:
-        await message.answer("Настройки расписания и модели задаются владельцем через .env.")
+        await message.answer("Выбор модели: /model. Остальные параметры задаются через .env.")
 
-    @router.callback_query()
+    router.include_router(build_model_router())
+    router.include_router(build_confirmation_router())
+    router.include_router(build_agent_router())
+
+    fallback = Router(name="callback-fallback")
+
+    @fallback.callback_query()
     async def callback_fallback(callback: CallbackQuery) -> None:
         await callback.answer("Действие больше не актуально.")
+
+    router.include_router(fallback)
 
     return router

@@ -5,7 +5,8 @@ from typing import Any
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from conference_scout.ai.openrouter import OpenRouterError
+from conference_scout.agent.actions import ActionUnavailable
+from conference_scout.ai.gateway import ModelGatewayError
 from conference_scout.ai.service import AIResponseError
 
 logger = logging.getLogger(__name__)
@@ -20,12 +21,9 @@ class ExternalErrorMiddleware(BaseMiddleware):
     ) -> Any:
         try:
             return await handler(event, data)
-        except (OpenRouterError, AIResponseError) as exc:
+        except (ModelGatewayError, AIResponseError, ActionUnavailable) as exc:
             logger.warning("LLM request failed", extra={"error": type(exc).__name__})
-            text = (
-                "OpenRouter временно не выполнил запрос. Возможен лимит бесплатной модели. "
-                "Подождите и отправьте тему ещё раз либо укажите другую модель в .env."
-            )
+            text = "Модель или действие сейчас недоступны. Попробуйте ещё раз или выберите /model."
             if isinstance(event, CallbackQuery):
                 await event.answer(text, show_alert=True)
             elif isinstance(event, Message) or hasattr(event, "answer"):

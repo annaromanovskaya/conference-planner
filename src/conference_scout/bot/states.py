@@ -8,3 +8,8 @@ class TopicFlow(StatesGroup):
 
 class SourceFlow(StatesGroup):
     waiting_value = State()
+
+
+class ModelFlow(StatesGroup):
+    choosing_profile = State()
+    choosing_model = State()

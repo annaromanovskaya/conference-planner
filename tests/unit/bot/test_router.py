@@ -8,3 +8,7 @@ def test_router_registers_owner_management_flows() -> None:
     assert isinstance(router, Router)
     assert router.message.handlers
     assert router.callback_query.handlers
+    assert [child.name for child in router.sub_routers][-2:] == [
+        "agent-chat",
+        "callback-fallback",
+    ]

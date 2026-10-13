@@ -1,4 +1,4 @@
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from aiogram import BaseMiddleware
@@ -13,10 +13,14 @@ from conference_scout.db.repositories.topics import TopicRepository
 
 class RepositoryMiddleware(BaseMiddleware):
     def __init__(
-        self, session_factory: async_sessionmaker[AsyncSession], owner_user_id: int
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        owner_user_id: int,
+        service_factory: Callable[[AsyncSession], Mapping[str, Any]] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.owner_user_id = owner_user_id
+        self.service_factory = service_factory
 
     async def __call__(
         self,
@@ -25,6 +29,7 @@ class RepositoryMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         async with self.session_factory() as session:
+            data["owner_user_id"] = self.owner_user_id
             for key, repository in (
                 ("topic_repository", TopicRepository(session)),
                 ("source_repository", SourceRepository(session)),
@@ -33,4 +38,6 @@ class RepositoryMiddleware(BaseMiddleware):
             ):
                 repository.owner_user_id = self.owner_user_id
                 data[key] = repository
+            if self.service_factory is not None:
+                data.update(self.service_factory(session))
             return await handler(event, data)
