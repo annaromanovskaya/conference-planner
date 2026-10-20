@@ -1,10 +1,11 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -17,19 +18,52 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 from conference_scout.db.base import Base, TimestampMixin, utc_now
 from conference_scout.schemas.common import (
+    AgentRunStatus,
+    AgentTaskStatus,
+    AgentTaskType,
+    ArtifactValidationState,
+    CandidateDecisionReason,
+    CandidateDecisionSource,
+    CandidateStatus,
     ConferenceStatus,
     ConversationStatus,
     DeadlineType,
+    EvidenceSourceClass,
     FeedbackDecision,
     KnowledgeRelationKind,
     MemoryKind,
     MemoryScope,
+    MonitoringAttemptStatus,
     PendingActionStatus,
+    ProgressEventType,
+    ProviderUsageStatus,
     SourceType,
+    VerificationStatus,
 )
+from conference_scout.schemas.parser_recipes import PageKind, RecipeStatus
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def process_result_value(self, value: datetime | None, _dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class User(Base):
@@ -102,16 +136,39 @@ class ConferenceTopic(Base):
 
 class Deadline(TimestampMixin, Base):
     __tablename__ = "deadlines"
-    __table_args__ = (UniqueConstraint("conference_id", "deadline_type"),)
+    __table_args__ = (
+        UniqueConstraint("conference_id", "deadline_type"),
+        CheckConstraint(
+            "(deadline_date IS NOT NULL AND approximate_year IS NULL "
+            "AND approximate_month IS NULL) OR "
+            "(deadline_date IS NULL AND approximate_year IS NOT NULL)",
+            name="deadline_exact_or_approximate",
+        ),
+        CheckConstraint(
+            "approximate_month IS NULL OR (approximate_month >= 1 AND approximate_month <= 12)",
+            name="deadline_approximate_month",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     conference_id: Mapped[int] = mapped_column(
         ForeignKey("conferences.id", ondelete="CASCADE"), index=True
     )
     deadline_type: Mapped[DeadlineType] = mapped_column(Enum(DeadlineType))
-    deadline_date: Mapped[date] = mapped_column(Date)
+    deadline_date: Mapped[date | None] = mapped_column(Date)
+    approximate_year: Mapped[int | None]
+    approximate_month: Mapped[int | None]
+    tentative: Mapped[bool] = mapped_column(Boolean, default=False)
     source_url: Mapped[str] = mapped_column(String(2_048))
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    verification_status: Mapped[VerificationStatus] = mapped_column(
+        Enum(VerificationStatus), default=VerificationStatus.SECONDARY_UNVERIFIED
+    )
+    source_class: Mapped[EvidenceSourceClass] = mapped_column(
+        Enum(EvidenceSourceClass), default=EvidenceSourceClass.SECONDARY
+    )
+    evidence_excerpt: Mapped[str | None] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True), default=utc_now)
     last_checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     conference: Mapped[Conference] = relationship(back_populates="deadlines")
@@ -154,6 +211,145 @@ class DeadlineHistory(Base):
     source_url: Mapped[str] = mapped_column(String(2_048))
 
 
+class ConferenceAlias(Base):
+    __tablename__ = "conference_aliases"
+    __table_args__ = (UniqueConstraint("conference_id", "normalized_alias"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conference_id: Mapped[int] = mapped_column(
+        ForeignKey("conferences.id", ondelete="CASCADE"), index=True
+    )
+    alias: Mapped[str] = mapped_column(String(500))
+    normalized_alias: Mapped[str] = mapped_column(String(500), index=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class ConferenceEvidence(Base):
+    __tablename__ = "conference_evidence"
+    __table_args__ = (UniqueConstraint("conference_id", "fact_kind", "fact_value", "source_url"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conference_id: Mapped[int] = mapped_column(
+        ForeignKey("conferences.id", ondelete="CASCADE"), index=True
+    )
+    fact_kind: Mapped[str] = mapped_column(String(100), index=True)
+    fact_value: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str] = mapped_column(String(2_048))
+    source_class: Mapped[EvidenceSourceClass] = mapped_column(Enum(EvidenceSourceClass))
+    excerpt: Mapped[str] = mapped_column(Text)
+    verification_status: Mapped[VerificationStatus] = mapped_column(Enum(VerificationStatus))
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class EventCandidate(TimestampMixin, Base):
+    __tablename__ = "event_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "source_url",
+            "normalized_title",
+            name="uq_event_candidates_user_source_title",
+        ),
+        Index("ix_event_candidates_user_status", "user_id", "status"),
+        Index("ix_event_candidates_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(String(500))
+    normalized_title: Mapped[str] = mapped_column(String(500), index=True)
+    source_url: Mapped[str] = mapped_column(String(2_048))
+    query: Mapped[str] = mapped_column(String(1_000))
+    relevance_score: Mapped[float] = mapped_column(Float, default=0.0)
+    summary: Mapped[str | None] = mapped_column(Text)
+    verification_status: Mapped[VerificationStatus] = mapped_column(Enum(VerificationStatus))
+    status: Mapped[CandidateStatus] = mapped_column(
+        Enum(CandidateStatus), default=CandidateStatus.ACTIVE
+    )
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True))
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    location: Mapped[str | None] = mapped_column(String(500))
+    official_url: Mapped[str | None] = mapped_column(String(2_048))
+    research_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    researched_at: Mapped[datetime | None] = mapped_column(UTCDateTime(timezone=True))
+    topic_relevance_score: Mapped[float | None] = mapped_column(Float)
+    topic_relevance_reason: Mapped[str | None] = mapped_column(Text)
+    decision_reason: Mapped[CandidateDecisionReason | None] = mapped_column(
+        Enum(CandidateDecisionReason)
+    )
+    decision_source: Mapped[CandidateDecisionSource | None] = mapped_column(
+        Enum(CandidateDecisionSource)
+    )
+    decision_at: Mapped[datetime | None] = mapped_column(UTCDateTime(timezone=True))
+    next_review_at: Mapped[datetime | None] = mapped_column(UTCDateTime(timezone=True))
+
+
+class ConferenceChange(Base):
+    __tablename__ = "conference_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conference_id: Mapped[int] = mapped_column(
+        ForeignKey("conferences.id", ondelete="CASCADE"), index=True
+    )
+    field_name: Mapped[str] = mapped_column(String(100), index=True)
+    old_value: Mapped[str | None] = mapped_column(Text)
+    new_value: Mapped[str | None] = mapped_column(Text)
+    source_url: Mapped[str] = mapped_column(String(2_048))
+    verification_status: Mapped[VerificationStatus] = mapped_column(Enum(VerificationStatus))
+    detected_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True), default=utc_now)
+
+
+class MonitoringAttempt(Base):
+    __tablename__ = "monitoring_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conference_id: Mapped[int] = mapped_column(
+        ForeignKey("conferences.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[MonitoringAttemptStatus] = mapped_column(
+        Enum(MonitoringAttemptStatus), index=True
+    )
+    source_url: Mapped[str | None] = mapped_column(String(2_048))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True), default=utc_now)
+
+
+class WebDocumentCache(TimestampMixin, Base):
+    __tablename__ = "web_document_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    canonical_url: Mapped[str] = mapped_column(String(2_048), unique=True, index=True)
+    etag: Mapped[str | None] = mapped_column(String(500))
+    last_modified: Mapped[str | None] = mapped_column(String(500))
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    extracted_text: Mapped[str] = mapped_column(Text)
+    status_code: Mapped[int] = mapped_column(default=200)
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True), default=utc_now)
+
+
+class SiteParserRecipe(TimestampMixin, Base):
+    __tablename__ = "site_parser_recipes"
+    __table_args__ = (
+        UniqueConstraint("domain", "page_kind", "version"),
+        Index("ix_site_parser_recipes_lookup", "domain", "page_kind", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    domain: Mapped[str] = mapped_column(String(253))
+    page_kind: Mapped[PageKind] = mapped_column(Enum(PageKind))
+    version: Mapped[int]
+    status: Mapped[RecipeStatus] = mapped_column(Enum(RecipeStatus), index=True)
+    card_selector: Mapped[str | None] = mapped_column(String(200))
+    field_selectors: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    link_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    regex_patterns: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    failure_count: Mapped[int] = mapped_column(default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+
+
 class ConferenceFeedback(Base):
     __tablename__ = "conference_feedback"
     __table_args__ = (UniqueConstraint("user_id", "conference_id"),)
@@ -185,6 +381,34 @@ class ModelCapability(Base):
     model_name: Mapped[str] = mapped_column(String(300))
     supports_tools: Mapped[bool] = mapped_column(Boolean)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class OllamaUsageDaily(TimestampMixin, Base):
+    __tablename__ = "ollama_usage_daily"
+    __table_args__ = (UniqueConstraint("user_id", "profile_id", "model_name", "usage_date"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    profile_id: Mapped[str] = mapped_column(String(100), index=True)
+    model_name: Mapped[str] = mapped_column(String(300), index=True)
+    usage_date: Mapped[date] = mapped_column(Date, index=True)
+    request_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    prompt_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cached_prompt_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class ProviderUsageState(Base):
+    __tablename__ = "provider_usage_status"
+    __table_args__ = (UniqueConstraint("user_id", "profile_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    profile_id: Mapped[str] = mapped_column(String(100), index=True)
+    status: Mapped[ProviderUsageStatus] = mapped_column(Enum(ProviderUsageStatus))
+    model_name: Mapped[str | None] = mapped_column(String(300))
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime(timezone=True))
+    detail_code: Mapped[str | None] = mapped_column(String(100))
 
 
 class Conversation(TimestampMixin, Base):
@@ -274,6 +498,71 @@ class KnowledgeRelation(Base):
     target_type: Mapped[str] = mapped_column(String(50), index=True)
     target_id: Mapped[int] = mapped_column(index=True)
     provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class AgentRun(TimestampMixin, Base):
+    __tablename__ = "agent_runs"
+    __table_args__ = (Index("ix_agent_runs_user_status", "user_id", "status"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    request_text: Mapped[str] = mapped_column(Text)
+    status: Mapped[AgentRunStatus] = mapped_column(Enum(AgentRunStatus), index=True)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSON)
+    budget: Mapped[dict[str, Any]] = mapped_column(JSON)
+    usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+
+
+class AgentTask(TimestampMixin, Base):
+    __tablename__ = "agent_tasks"
+    __table_args__ = (
+        UniqueConstraint("run_id", "task_key"),
+        Index("ix_agent_tasks_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"))
+    task_key: Mapped[str] = mapped_column(String(100))
+    task_type: Mapped[AgentTaskType] = mapped_column(Enum(AgentTaskType))
+    status: Mapped[AgentTaskStatus] = mapped_column(Enum(AgentTaskStatus), index=True)
+    dependencies: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(default=0)
+    retryable: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+
+
+class AgentArtifact(Base):
+    __tablename__ = "agent_artifacts"
+    __table_args__ = (Index("ix_agent_artifacts_run_kind", "run_id", "artifact_kind"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"))
+    task_id: Mapped[int] = mapped_column(ForeignKey("agent_tasks.id", ondelete="CASCADE"))
+    artifact_kind: Mapped[str] = mapped_column(String(100))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source_hashes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    validation_state: Mapped[ArtifactValidationState] = mapped_column(
+        Enum(ArtifactValidationState), default=ArtifactValidationState.UNVALIDATED
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class AgentProgressEvent(Base):
+    __tablename__ = "agent_progress_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence"),
+        Index("ix_agent_progress_events_run_sequence", "run_id", "sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"))
+    sequence: Mapped[int]
+    event_type: Mapped[ProgressEventType] = mapped_column(Enum(ProgressEventType))
+    message: Mapped[str] = mapped_column(Text)
+    safe_data: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
 
 
