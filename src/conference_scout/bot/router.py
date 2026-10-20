@@ -1,12 +1,14 @@
 from html import escape
+from urllib.parse import urlsplit
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from conference_scout.bot.access import OwnerOnlyMiddleware
-from conference_scout.bot.agent_router import build_agent_router
+from conference_scout.bot.agent_router import build_agent_router, handle_search_query
+from conference_scout.bot.conference_router import build_conference_router
 from conference_scout.bot.confirmation_router import build_confirmation_router
 from conference_scout.bot.errors import ExternalErrorMiddleware
 from conference_scout.bot.keyboards import (
@@ -16,8 +18,30 @@ from conference_scout.bot.keyboards import (
     topic_confirmation,
 )
 from conference_scout.bot.model_router import build_model_router
-from conference_scout.bot.states import SourceFlow, TopicFlow
+from conference_scout.bot.states import SearchFlow, SourceFlow, TopicFlow
+from conference_scout.bot.usage_router import build_usage_router
 from conference_scout.schemas.common import SourceType
+
+MAIN_MENU_BUTTONS = frozenset(
+    {
+        "Мои темы",
+        "Найти конференции",
+        "Конференции",
+        "Ближайшие дедлайны",
+        "Следующий кандидат",
+        "Источники",
+        "Настройки",
+    }
+)
+
+NEXT_CANDIDATE_TEXTS = frozenset(
+    {
+        "дальше",
+        "следующий кандидат",
+        "начинай верификацию",
+        "давай дальше",
+    }
+)
 
 
 def build_router(*, owner_telegram_id: int) -> Router:
@@ -28,18 +52,39 @@ def build_router(*, owner_telegram_id: int) -> Router:
     router.callback_query.middleware(OwnerOnlyMiddleware(owner_telegram_id))
 
     @router.message(CommandStart())
-    async def start(message: Message) -> None:
+    async def start(message: Message, state: FSMContext) -> None:
+        await state.clear()
         await message.answer(
             "🔭 Conference Planner\n\nЯ — ваш AI-агент по научным конференциям. "
             "Просто напишите вопрос или задачу. /model — выбрать модель, /help — помощь.",
             reply_markup=main_menu(),
         )
 
+    @router.message(Command("cancel"))
+    async def cancel_command(message: Message, state: FSMContext) -> None:
+        await cancel_flow(message, state)
+
     @router.message(F.text == "Мои темы")
-    async def topics(message: Message, topic_repository) -> None:
+    async def topics(message: Message, state: FSMContext, topic_repository) -> None:
+        await open_menu(state)
         values = await topic_repository.list_for_user(topic_repository.owner_user_id)
         text = "\n".join(f"⭐ {escape(item.name)}" for item in values) or "Тем пока нет."
-        await message.answer(text, reply_markup=add_buttons("topic"))
+        await message.answer(text, reply_markup=add_buttons("topic"), parse_mode="HTML")
+
+    @router.message(F.text == "Найти конференции")
+    async def find_conferences(message: Message, state: FSMContext) -> None:
+        await open_menu(state)
+        await state.set_state(SearchFlow.waiting_query)
+        await message.answer("Введите тему, название конференции, год или ссылку для поиска.")
+
+    @router.message(SearchFlow.waiting_query, F.text.func(is_flow_text))
+    async def search_query(
+        message: Message,
+        state: FSMContext,
+        agent_runtime,
+        owner_user_id: int,
+    ) -> None:
+        await handle_search_query(message, state, agent_runtime, owner_user_id=owner_user_id)
 
     @router.callback_query(F.data == "topic:add")
     async def topic_add(callback: CallbackQuery, state: FSMContext) -> None:
@@ -47,7 +92,7 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await callback.message.answer("Опишите научную тематику свободным текстом.")
         await callback.answer()
 
-    @router.message(TopicFlow.waiting_text)
+    @router.message(TopicFlow.waiting_text, F.text.func(is_flow_text))
     async def topic_preview(message: Message, state: FSMContext, ai_service) -> None:
         value = await ai_service.normalize_topic(message.text or "")
         await state.update_data(topic=value.model_dump(mode="json"))
@@ -93,7 +138,8 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await callback.answer()
 
     @router.message(F.text == "Источники")
-    async def sources(message: Message, source_repository) -> None:
+    async def sources(message: Message, state: FSMContext, source_repository) -> None:
+        await open_menu(state)
         values = await source_repository.list_all()
         text = (
             "\n".join(
@@ -121,11 +167,11 @@ def build_router(*, owner_telegram_id: int) -> Router:
     async def source_add(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(SourceFlow.waiting_value)
         await callback.message.answer(
-            "Введите DOMAIN example.org или PAGE https://example.org/events"
+            "Введите домен (например, iau.org) или полную ссылку на страницу мероприятий."
         )
         await callback.answer()
 
-    @router.message(SourceFlow.waiting_value)
+    @router.message(SourceFlow.waiting_value, F.text.func(is_flow_text))
     async def source_value(
         message: Message,
         state: FSMContext,
@@ -134,34 +180,19 @@ def build_router(*, owner_telegram_id: int) -> Router:
     ) -> None:
         from conference_scout.schemas.agent import AddSourceAction
 
-        kind, separator, value = (message.text or "").strip().partition(" ")
-        if not separator or kind.upper() not in SourceType.__members__ or not value.strip():
-            await message.answer("Формат: DOMAIN example.org или PAGE https://example.org/events")
+        parsed = parse_source_input(message.text or "")
+        if parsed is None:
+            await message.answer(
+                "Введите домен (example.org) или ссылку на страницу (https://example.org/events)."
+            )
             return
-        source_type = SourceType[kind.upper()]
+        source_type, value = parsed
         pending = await confirmation_service.propose(
             owner_user_id,
-            AddSourceAction(source_type=source_type, value=value.strip()),
+            AddSourceAction(source_type=source_type, value=value),
         )
         await state.clear()
         await message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
-
-    @router.message(F.text == "Конференции")
-    async def conferences(message: Message, conference_repository) -> None:
-        from conference_scout.schemas.common import ConferenceStatus
-
-        blocks: list[str] = []
-        for status, title in (
-            (ConferenceStatus.TRACKING, "Отслеживаемые"),
-            (ConferenceStatus.DISCOVERED, "Найденные"),
-            (ConferenceStatus.ARCHIVED, "Архив"),
-        ):
-            values = await conference_repository.list_accessible_by_status(
-                conference_repository.owner_user_id, status
-            )
-            lines = "\n".join(f"• {escape(item.name)} (ID {item.id})" for item in values) or "—"
-            blocks.append(f"<b>{title}</b>\n{lines}")
-        await message.answer("\n\n".join(blocks), parse_mode="HTML")
 
     @router.callback_query(F.data.startswith("conference:track:"))
     async def track(callback: CallbackQuery, confirmation_service, owner_user_id: int) -> None:
@@ -185,23 +216,8 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await callback.message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
         await callback.answer()
 
-    @router.message(F.text == "Ближайшие дедлайны")
-    async def deadlines(message: Message, reminder_repository) -> None:
-        values = await reminder_repository.candidates(reminder_repository.owner_user_id)
-        values.sort(key=lambda item: item.deadline_date)
-        text = (
-            "\n".join(
-                f"• {escape(item.conference_name)} — {item.deadline_date.isoformat()}"
-                for item in values
-            )
-            or "Будущих дедлайнов пока нет."
-        )
-        await message.answer(text)
-
-    @router.message(F.text == "Настройки")
-    async def settings(message: Message) -> None:
-        await message.answer("Выбор модели: /model. Остальные параметры задаются через .env.")
-
+    router.include_router(build_conference_router())
+    router.include_router(build_usage_router())
     router.include_router(build_model_router())
     router.include_router(build_confirmation_router())
     router.include_router(build_agent_router())
@@ -215,3 +231,41 @@ def build_router(*, owner_telegram_id: int) -> Router:
     router.include_router(fallback)
 
     return router
+
+
+def is_flow_text(text: str | None) -> bool:
+    value = (text or "").strip()
+    return (
+        bool(value)
+        and not value.startswith("/")
+        and value not in MAIN_MENU_BUTTONS
+        and not is_next_candidate_text(value)
+    )
+
+
+def is_next_candidate_text(text: str | None) -> bool:
+    return (text or "").strip().casefold() in NEXT_CANDIDATE_TEXTS
+
+
+def parse_source_input(text: str) -> tuple[SourceType, str] | None:
+    value = text.strip()
+    if not value:
+        return None
+    kind, separator, explicit_value = value.partition(" ")
+    if separator and kind.upper() in SourceType.__members__ and explicit_value.strip():
+        return SourceType[kind.upper()], explicit_value.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return SourceType.PAGE, value
+    if " " not in value and "." in value and "/" not in value:
+        return SourceType.DOMAIN, value
+    return None
+
+
+async def open_menu(state: FSMContext) -> None:
+    await state.clear()
+
+
+async def cancel_flow(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Текущее действие отменено.", reply_markup=main_menu())
