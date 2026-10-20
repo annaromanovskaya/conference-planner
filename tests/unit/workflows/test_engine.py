@@ -248,3 +248,8 @@ async def test_engine_persists_workflow_kind_and_finds_owner_active_run(
     ).id == run.id
     assert await repository.find_active_run(second.id, WorkflowKind.CONFERENCE_CYCLE) is None
     assert await repository.find_active_run(first.id, WorkflowKind.CONFERENCE_RESEARCH) is None
+    recoverable = await repository.list_recoverable_runs(
+        WorkflowKind.CONFERENCE_CYCLE
+    )
+    assert [item.id for item in recoverable] == [run.id]
+    assert await repository.list_recoverable_runs(WorkflowKind.CONFERENCE_RESEARCH) == []

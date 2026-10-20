@@ -234,19 +234,24 @@ class AgentWorkflowRepository:
         await self.session.flush()
         return run
 
-    async def list_recoverable_runs(self) -> list[AgentRun]:
+    async def list_recoverable_runs(
+        self, workflow_kind: WorkflowKind | None = None
+    ) -> list[AgentRun]:
+        conditions = [
+            AgentRun.status.in_(
+                {
+                    AgentRunStatus.PLANNED,
+                    AgentRunStatus.RUNNING,
+                    AgentRunStatus.PARTIAL,
+                }
+            )
+        ]
+        if workflow_kind is not None:
+            conditions.append(AgentRun.workflow_kind == workflow_kind)
         return list(
             await self.session.scalars(
                 select(AgentRun)
-                .where(
-                    AgentRun.status.in_(
-                        {
-                            AgentRunStatus.PLANNED,
-                            AgentRunStatus.RUNNING,
-                            AgentRunStatus.PARTIAL,
-                        }
-                    )
-                )
+                .where(*conditions)
                 .order_by(AgentRun.id)
             )
         )

@@ -123,10 +123,12 @@ class WorkflowEngine:
     async def recover_incomplete_runs(
         self,
         progress: ProgressSink | None = None,
+        *,
+        workflow_kind: WorkflowKind | None = None,
     ) -> RecoveryReport:
         recovered: list[int] = []
         failed: list[int] = []
-        for run in await self.repository.list_recoverable_runs():
+        for run in await self.repository.list_recoverable_runs(workflow_kind):
             tasks = await self.repository.list_tasks(run.id)
             if run.status == AgentRunStatus.PARTIAL and not any(
                 task.retryable for task in tasks

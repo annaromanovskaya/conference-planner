@@ -84,6 +84,7 @@ from conference_scout.schemas.agent import (
     UpsertDeadlineAction,
 )
 from conference_scout.schemas.common import (
+    AgentRunStatus,
     AgentTaskType,
     ArtifactValidationState,
     CandidateDecisionReason,
@@ -93,6 +94,7 @@ from conference_scout.schemas.common import (
     EvidenceSourceClass,
     ModelRole,
     VerificationStatus,
+    WorkflowKind,
 )
 from conference_scout.schemas.research import (
     ConferenceResearch,
@@ -586,18 +588,57 @@ async def _run_bot(
                 fetcher,
                 application_clock,
             )
-            recovery = await engine.recover_incomplete_runs(progress)
-        if recovery.recovered_run_ids:
+            recovery = await engine.recover_incomplete_runs(
+                progress,
+                workflow_kind=WorkflowKind.CONFERENCE_RESEARCH,
+            )
+            cycle_repository = AgentWorkflowRepository(session)
+            active_cycle = await cycle_repository.find_active_run(
+                owner.user_id, WorkflowKind.CONFERENCE_CYCLE
+            )
+            cycle_recovered_id = None
+            cycle_failed_id = None
+            if active_cycle is not None:
+                registry = _model_registry(session, profiles, settings=settings)
+                cycle = _conference_cycle_service(
+                    session,
+                    owner.user_id,
+                    settings,
+                    registry,
+                    search,
+                    fetcher,
+                    application_clock,
+                )
+                try:
+                    cycle_report = await cycle.run(
+                        owner.user_id,
+                        CycleRequest(mode=CycleMode.SCHEDULED),
+                        progress=WorkflowProgress(cycle_repository),
+                    )
+                except Exception:
+                    cycle_failed_id = active_cycle.id
+                else:
+                    if cycle_report.status == AgentRunStatus.COMPLETED:
+                        cycle_recovered_id = active_cycle.id
+                    else:
+                        cycle_failed_id = active_cycle.id
+        recovered_ids = list(recovery.recovered_run_ids)
+        failed_ids = list(recovery.failed_run_ids)
+        if cycle_recovered_id is not None:
+            recovered_ids.append(cycle_recovered_id)
+        if cycle_failed_id is not None:
+            failed_ids.append(cycle_failed_id)
+        if recovered_ids:
             await bot.send_message(
                 owner.telegram_id,
                 "Восстановлены прерванные задачи: "
-                + ", ".join(map(str, recovery.recovered_run_ids)),
+                + ", ".join(map(str, recovered_ids)),
             )
-        if recovery.failed_run_ids:
+        if failed_ids:
             await bot.send_message(
                 owner.telegram_id,
                 "Не удалось восстановить задачи: "
-                + ", ".join(map(str, recovery.failed_run_ids)),
+                + ", ".join(map(str, failed_ids)),
             )
     configure_scheduler(
         scheduler,
