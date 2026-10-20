@@ -13,6 +13,12 @@ from aiogram.types import Message
 from conference_scout.agent.capabilities import capability_help_text, is_capability_question
 from conference_scout.agent.runtime import AgentReply, AgentRuntime
 from conference_scout.bot.keyboards import action_confirmation, main_menu
+from conference_scout.conferences.cycle import (
+    ConferenceCycleReport,
+    ConferenceCycleService,
+    CycleMode,
+    CycleRequest,
+)
 from conference_scout.schemas.common import ProgressEventType
 from conference_scout.workflows.progress import ProgressEvent
 
@@ -62,6 +68,9 @@ class TelegramWorkflowReporter:
                 return
             self.last_text = text
             self._last_edit_at = now
+
+    async def emit(self, _run_id: int, event: ProgressEvent) -> None:
+        await self.update(event)
 
     async def heartbeat(self) -> None:
         while True:
@@ -169,25 +178,58 @@ async def send_agent_reply(message: Message, reply) -> None:
 async def handle_search_query(
     message: Message,
     state: FSMContext,
-    agent_runtime: AgentRuntime,
+    conference_cycle_service: ConferenceCycleService,
     *,
     owner_user_id: int,
 ) -> None:
     await state.clear()
     query = (message.text or "").strip()
-    instruction = (
-        f"Найди и проверь конференции по запросу: {query}. "
-        "Начни search_conference_candidates с page=1 и переходи к next_page, если результатов "
-        "недостаточно. При необходимости расширяй запрос на русском и английском. Затем "
-        "используй get_candidate для подходящих результатов. Не выдавай непроверенные "
-        "сведения как подтверждённые."
-    )
-    await _run_agent_request(
-        message,
-        agent_runtime,
-        owner_user_id=owner_user_id,
-        text=instruction,
-    )
+    lock = _CHAT_LOCKS.setdefault(message.chat.id, asyncio.Lock())
+    if lock.locked():
+        await message.answer(
+            "Цикл проверки уже выполняется. Дождитесь итогового отчёта.",
+            reply_markup=main_menu(),
+        )
+        return
+    async with lock:
+        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        status_message = await message.answer("Запускаю полный цикл проверки конференций…")
+        reporter = TelegramWorkflowReporter(status_message)
+        heartbeat = asyncio.create_task(reporter.heartbeat())
+        try:
+            report = await conference_cycle_service.run(
+                owner_user_id,
+                CycleRequest(mode=CycleMode.MANUAL, query=query),
+                progress=reporter,
+            )
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+        await reporter.update("Цикл проверки завершён.")
+        await message.answer(format_cycle_report(report), reply_markup=main_menu())
+
+
+def format_cycle_report(report: ConferenceCycleReport) -> str:
+    lines = [
+        "ПРОВЕРКА КОНФЕРЕНЦИЙ ЗАВЕРШЕНА",
+        "",
+        f"Проверено отслеживаемых: {report.checked_tracked}",
+        f"Обновлено отслеживаемых: {report.updated_tracked}",
+        f"Возвращено пропущенных: {report.reactivated_candidates}",
+        f"Новых кандидатов: {len(report.new_candidate_ids)}",
+        f"Исключено дублей: {report.duplicates}",
+        f"Проверено страниц поиска: {report.pages_checked}",
+        f"Ошибок: {len(report.errors)}",
+    ]
+    if report.new_candidate_ids:
+        lines.extend(("", "Нажмите «Следующий кандидат», чтобы начать рассмотрение."))
+    if report.errors:
+        lines.extend(("", "Коды ошибок: " + ", ".join(report.errors)))
+    lines.extend(("", f"Номер запуска: {report.run_id}."))
+    return "\n".join(lines)
 
 
 async def _run_agent_request(

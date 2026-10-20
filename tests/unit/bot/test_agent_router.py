@@ -15,8 +15,10 @@ from conference_scout.bot.agent_router import (
     handle_new,
 )
 from conference_scout.bot.keyboards import main_menu
+from conference_scout.conferences.cycle import ConferenceCycleReport, CycleMode
 from conference_scout.schemas.agent import DomainReference, PendingActionView
-from conference_scout.schemas.common import PendingActionStatus
+from conference_scout.schemas.common import AgentRunStatus, PendingActionStatus, ProgressEventType
+from conference_scout.workflows.progress import ProgressEvent
 
 
 class FakeMessage:
@@ -215,28 +217,47 @@ def test_hyphens_inside_numbered_conference_name_are_not_rendered_as_bullets() -
 
 
 @pytest.mark.asyncio
-async def test_search_flow_clears_state_before_sending_query_to_agent() -> None:
+async def test_search_flow_clears_state_and_runs_unified_cycle_with_raw_query() -> None:
     class State:
         cleared = False
 
         async def clear(self):
             self.cleared = True
 
-    class Runtime:
-        async def respond(self, user_id, text, **_kwargs):
+    class CycleService:
+        async def run(self, user_id, request, progress=None):
             assert user_id == 7
-            assert "IAU 2027" in text
-            assert "search_conference_candidates" in text
-            assert "get_candidate" in text
-            return AgentReply(text="Результат")
+            assert request.mode == CycleMode.MANUAL
+            assert request.query == "IAU 2027"
+            assert progress is not None
+            await progress.emit(
+                14,
+                ProgressEvent(
+                    event_type=ProgressEventType.TOOL_STARTED,
+                    message="Проверяю отслеживаемые конференции.",
+                ),
+            )
+            return ConferenceCycleReport(
+                run_id=14,
+                status=AgentRunStatus.COMPLETED,
+                checked_tracked=3,
+                updated_tracked=1,
+                reactivated_candidates=2,
+                new_candidate_ids=(41, 42),
+                duplicates=4,
+                pages_checked=5,
+            )
 
     state = State()
     message = FakeMessage("IAU 2027")
 
-    await agent_router.handle_search_query(message, state, Runtime(), owner_user_id=7)
+    await agent_router.handle_search_query(
+        message, state, CycleService(), owner_user_id=7
+    )
 
     assert state.cleared is True
-    assert message.answers[-1][0] == "Результат"
+    assert "Новых кандидатов: 2" in message.answers[-1][0]
+    assert "Номер запуска: 14" in message.answers[-1][0]
 
 
 @pytest.mark.asyncio

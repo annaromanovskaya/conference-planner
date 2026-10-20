@@ -81,10 +81,15 @@ def build_router(*, owner_telegram_id: int) -> Router:
     async def search_query(
         message: Message,
         state: FSMContext,
-        agent_runtime,
+        conference_cycle_service,
         owner_user_id: int,
     ) -> None:
-        await handle_search_query(message, state, agent_runtime, owner_user_id=owner_user_id)
+        await handle_search_query(
+            message,
+            state,
+            conference_cycle_service,
+            owner_user_id=owner_user_id,
+        )
 
     @router.callback_query(F.data == "topic:add")
     async def topic_add(callback: CallbackQuery, state: FSMContext) -> None:

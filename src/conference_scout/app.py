@@ -20,8 +20,14 @@ from conference_scout.ai.registry import ModelRegistry, ProviderProfile, build_p
 from conference_scout.ai.service import AIService
 from conference_scout.ai.usage import OllamaUsageService
 from conference_scout.bot.dependencies import RepositoryMiddleware
+from conference_scout.bot.agent_router import format_cycle_report
 from conference_scout.bot.router import build_router
-from conference_scout.conferences.cycle import ConferenceCycleService
+from conference_scout.conferences.cycle import (
+    ConferenceCycleReport,
+    ConferenceCycleService,
+    CycleMode,
+    CycleRequest,
+)
 from conference_scout.conferences.deduplication import normalize_name
 from conference_scout.conferences.discovery import DiscoveryService
 from conference_scout.conferences.evidence import EvidenceDocument, EvidenceValidator
@@ -344,6 +350,16 @@ async def _run_scheduled_discovery(
     return tuple(int(item) for item in artifacts[-1].payload.get("candidate_ids", []))
 
 
+async def _run_scheduled_conference_cycle(
+    user_id: int,
+    conference_cycle_service: ConferenceCycleService,
+) -> ConferenceCycleReport:
+    return await conference_cycle_service.run(
+        user_id,
+        CycleRequest(mode=CycleMode.SCHEDULED),
+    )
+
+
 class _MCPConfirmationProxy:
     def __init__(self, session_factory, owner_id: int) -> None:
         self.session_factory = session_factory
@@ -525,66 +541,20 @@ async def _run_bot(
     router.callback_query.middleware(middleware)
     dispatcher.include_router(router)
 
-    async def discovery_job() -> None:
+    async def conference_cycle_job() -> None:
         async with session_factory() as session:
             registry = _model_registry(session, profiles, settings=settings)
-            service = _discovery_service(
-                session, owner.user_id, settings, registry, search, fetcher
-            )
-            current_year = application_clock.today().year
-            years = [current_year, current_year + 1]
-            if settings.agent_workflows_enabled:
-                created_ids = await _run_scheduled_discovery(
-                    session, owner.user_id, service, years=years
-                )
-            else:
-                report = await service.run(owner.user_id, years=years)
-                created_ids = tuple(report.created_ids)
-            if created_ids:
-                await bot.send_message(
-                    owner.telegram_id,
-                    f"🔎 Найдено новых конференций: {len(created_ids)}",
-                )
-
-    async def monitoring_job() -> None:
-        async with session_factory() as session:
-            registry = _model_registry(session, profiles, settings=settings)
-            ai = _research_ai_service(registry, owner.user_id)
-            report = await MonitoringService(
+            service = _conference_cycle_service(
                 session,
-                fetcher,
-                ai,
-                settings.max_page_bytes,
-                settings.max_page_text_chars,
+                owner.user_id,
+                settings,
+                registry,
                 search,
-                cache=WebDocumentCacheRepository(session),
-                recipes=ParserRecipeRepository(session),
-                reader=_reader_fallback(settings, fetcher),
-                monitoring_interval_hours=settings.monitoring_interval_hours,
-            ).run(owner.user_id)
-            for conversion in report.catalogs:
-                await bot.send_message(
-                    owner.telegram_id,
-                    conversion.telegram_summary(),
-                )
-            for receipt in (*report.created, *report.changed):
-                await bot.send_message(
-                    owner.telegram_id,
-                    "Мониторинг конференций. " + receipt.telegram_summary(),
-                )
-            for receipt in report.conflicts:
-                await bot.send_message(
-                    owner.telegram_id,
-                    "Мониторинг обнаружил конфликт источников. Данные не изменены. "
-                    + receipt.telegram_summary(),
-                )
-            for failure in report.errors:
-                if failure.consecutive_failures >= 3:
-                    await bot.send_message(
-                        owner.telegram_id,
-                        f"Не удалось проверить конференцию {failure.conference_id} "
-                        f"{failure.consecutive_failures} раза подряд. Код: {failure.error_code}.",
-                    )
+                fetcher,
+                application_clock,
+            )
+            report = await _run_scheduled_conference_cycle(owner.user_id, service)
+        await bot.send_message(owner.telegram_id, format_cycle_report(report))
 
     async def reminder_job() -> None:
         async with session_factory() as session:
@@ -629,12 +599,10 @@ async def _run_bot(
             )
     configure_scheduler(
         scheduler,
-        discovery_job=discovery_job,
-        monitoring_job=monitoring_job,
+        conference_cycle_job=conference_cycle_job,
         reminder_job=reminder_job,
-        discovery_day=settings.discovery_day,
         discovery_hour=settings.discovery_hour,
-        monitoring_hour=settings.monitoring_hour,
+        reminder_hour=settings.reminder_hour,
         timezone=settings.app_timezone,
     )
     scheduler.start()

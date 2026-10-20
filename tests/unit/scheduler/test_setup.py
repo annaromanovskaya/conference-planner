@@ -11,14 +11,15 @@ def test_scheduler_has_stable_non_overlapping_jobs() -> None:
     scheduler = AsyncIOScheduler()
     configure_scheduler(
         scheduler,
-        discovery_job=noop,
-        monitoring_job=noop,
+        conference_cycle_job=noop,
         reminder_job=noop,
-        discovery_day="sun",
         discovery_hour=10,
-        monitoring_hour=9,
+        reminder_hour=9,
         timezone="UTC",
     )
     jobs = {job.id: job for job in scheduler.get_jobs()}
-    assert set(jobs) == {"weekly-discovery", "daily-monitoring", "hourly-reminders"}
+    assert set(jobs) == {"weekly-conference-cycle", "daily-deadline-reminders"}
     assert all(job.max_instances == 1 and job.coalesce for job in jobs.values())
+    assert "day_of_week='mon'" in str(jobs["weekly-conference-cycle"].trigger)
+    assert "hour='10'" in str(jobs["weekly-conference-cycle"].trigger)
+    assert "hour='9'" in str(jobs["daily-deadline-reminders"].trigger)

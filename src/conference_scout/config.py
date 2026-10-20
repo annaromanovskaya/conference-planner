@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from conference_scout.schemas.common import ModelRole
+
 
 class Settings(BaseSettings):
     """Validated process configuration loaded exclusively from the environment."""
@@ -23,22 +25,29 @@ class Settings(BaseSettings):
         "nemotron-3-super",
         "nemotron-3-ultra",
     )
-    ollama_local_base_url: HttpUrl | None = None
-    ollama_local_api_key: SecretStr | None = None
-    local_openai_base_url: HttpUrl | None = None
-    local_openai_api_key: SecretStr | None = None
+    llm_hub_base_url: HttpUrl | None = None
+    llm_hub_api_key: SecretStr | None = None
     agent_max_steps: int = Field(default=6, ge=1, le=20)
     agent_max_tool_calls_per_step: int = Field(default=3, ge=1, le=20)
-    agent_timeout_seconds: float = Field(default=90, gt=0, le=600)
+    agent_timeout_seconds: float = Field(default=300, gt=0, le=600)
+    tracked_check_timeout_seconds: float = Field(default=300, gt=0, le=600)
     agent_max_context_chars: int = Field(default=24_000, ge=1_000)
     agent_max_tool_result_chars: int = Field(default=12_000, ge=1_000)
+    agent_supervisor_model: str | None = None
+    agent_research_model: str | None = None
+    agent_verifier_model: str | None = None
+    agent_fallback_model: str | None = None
+    agent_workflows_enabled: bool = True
     mcp_host: str = "127.0.0.1"
     mcp_port: int = Field(default=8765, ge=1, le=65_535)
     database_url: str = "sqlite+aiosqlite:////data/conference_scout.db"
     searxng_url: HttpUrl = HttpUrl("http://searxng:8080")
+    reader_fallback_url: HttpUrl | None = HttpUrl("https://r.jina.ai")
     discovery_day: str = "sun"
     discovery_hour: int = Field(default=10, ge=0, le=23)
+    reminder_hour: int = Field(default=9, ge=0, le=23)
     monitoring_hour: int = Field(default=9, ge=0, le=23)
+    monitoring_interval_hours: int = Field(default=72, ge=24, le=720)
     reminder_days: Annotated[tuple[int, ...], NoDecode] = (30, 14, 7, 3, 1)
     min_relevance_score: float = Field(default=0.5, ge=0, le=1)
     app_timezone: str = "UTC"
@@ -67,6 +76,33 @@ class Settings(BaseSettings):
             if not value.strip():
                 raise ValueError("OLLAMA_CLOUD_FREE_MODELS cannot be empty")
             return tuple(item.strip() for item in value.split(",") if item.strip())
+        return value
+
+    @field_validator("llm_hub_base_url", mode="before")
+    @classmethod
+    def empty_llm_hub_url_is_disabled(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("reader_fallback_url", mode="before")
+    @classmethod
+    def empty_reader_url_is_disabled(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "agent_supervisor_model",
+        "agent_research_model",
+        "agent_verifier_model",
+        "agent_fallback_model",
+        mode="before",
+    )
+    @classmethod
+    def empty_role_model_uses_active_model(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
     @field_validator("ollama_cloud_free_models")
@@ -99,3 +135,13 @@ class Settings(BaseSettings):
     @cached_property
     def timezone(self) -> ZoneInfo:
         return ZoneInfo(self.app_timezone)
+
+    @property
+    def model_role_overrides(self) -> dict[ModelRole, str]:
+        values = {
+            ModelRole.SUPERVISOR: self.agent_supervisor_model,
+            ModelRole.RESEARCH: self.agent_research_model,
+            ModelRole.VERIFIER: self.agent_verifier_model,
+            ModelRole.FALLBACK: self.agent_fallback_model,
+        }
+        return {role: model for role, model in values.items() if model}
