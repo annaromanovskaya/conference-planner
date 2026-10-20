@@ -1,9 +1,10 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, TypeAdapter, model_validator
 
 from conference_scout.schemas.common import (
+    DeadlineType,
     MemoryKind,
     MemoryScope,
     PendingActionStatus,
@@ -138,6 +139,27 @@ class TrackConferenceAction(BaseModel):
         return f"Отслеживать конференцию {self.conference_id}"
 
 
+class ImportConferenceCandidateAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["import_conference_candidate"] = "import_conference_candidate"
+    candidate_id: int = Field(gt=0)
+
+    def confirmation_summary(self) -> str:
+        return f"Проверить, сохранить и отслеживать кандидата {self.candidate_id}"
+
+
+class ImportConferenceURLAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["import_conference_url"] = "import_conference_url"
+    title: str = Field(min_length=1, max_length=500)
+    source_url: HttpUrl
+
+    def confirmation_summary(self) -> str:
+        return f"Проверить, сохранить и отслеживать «{self.title}»"
+
+
 class ArchiveConferenceAction(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -176,14 +198,70 @@ class RunDiscoveryAction(BaseModel):
         return f"Запустить поиск конференций за {years}"
 
 
+class SetCandidateDecisionAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["set_candidate_decision"] = "set_candidate_decision"
+    candidate_id: int = Field(gt=0)
+    decision: Literal["ACTIVE", "SKIPPED", "REJECTED"]
+
+    def confirmation_summary(self) -> str:
+        labels = {
+            "ACTIVE": "Вернуть кандидата в очередь",
+            "SKIPPED": "Пропустить кандидата",
+            "REJECTED": "Отклонить кандидата",
+        }
+        return f"{labels[self.decision]} {self.candidate_id}"
+
+
+class UpsertDeadlineAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["upsert_deadline"] = "upsert_deadline"
+    conference_id: int = Field(gt=0)
+    deadline_type: DeadlineType
+    exact_date: date | None = None
+    approximate_year: int | None = Field(default=None, ge=2000, le=2200)
+    approximate_month: int | None = Field(default=None, ge=1, le=12)
+    tentative: bool = True
+    source_url: HttpUrl | None = None
+
+    @model_validator(mode="after")
+    def exact_or_approximate(self) -> "UpsertDeadlineAction":
+        exact = self.exact_date is not None
+        approximate = self.approximate_year is not None
+        if exact == approximate:
+            raise ValueError("provide exactly one of exact_date or approximate_year")
+        if exact and self.approximate_month is not None:
+            raise ValueError("exact deadline cannot also have approximate_month")
+        return self
+
+    def confirmation_summary(self) -> str:
+        if self.exact_date is not None:
+            when = self.exact_date.isoformat()
+        else:
+            when = str(self.approximate_year)
+            if self.approximate_month is not None:
+                when += f"-{self.approximate_month:02d}"
+            when += " (ориентировочно)"
+        return (
+            f"Записать дедлайн {self.deadline_type.value} для конференции "
+            f"{self.conference_id}: {when}"
+        )
+
+
 ActionPayload = Annotated[
     AddTopicAction
     | AddSourceAction
     | TrackConferenceAction
+    | ImportConferenceCandidateAction
+    | ImportConferenceURLAction
     | ArchiveConferenceAction
     | SaveMemoryAction
     | ForgetMemoryAction
-    | RunDiscoveryAction,
+    | RunDiscoveryAction
+    | SetCandidateDecisionAction
+    | UpsertDeadlineAction,
     Field(discriminator="action"),
 ]
 

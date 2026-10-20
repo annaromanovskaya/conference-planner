@@ -29,10 +29,17 @@ async def test_streamable_http_negotiates_lists_and_calls_tools() -> None:
         assert (owner_id, arguments) == (77, {"limit": 2})
         return {"items": [{"kind": "topic", "id": 3, "name": "Astronomy"}]}
 
+    async def conference_context(owner_id: int, arguments: dict):
+        assert owner_id == 77
+        return {"kind": "conference", "id": arguments["conference_id"]}
+
     server = build_mcp_server(
         MCPToolServices(
             owner_id=77,
-            read_handlers={"list_topics": topics},
+            read_handlers={
+                "list_topics": topics,
+                "get_conference_context": conference_context,
+            },
             confirmation=ConfirmationStub(),
         )
     )
@@ -57,7 +64,7 @@ async def test_streamable_http_negotiates_lists_and_calls_tools() -> None:
                     unknown = await session.call_tool("run_shell", {})
 
     assert initialized.server_info.name == "ConfPlanner"
-    assert len(tools.tools) == 17
+    assert len(tools.tools) == 31
     assert read.is_error is False and "Astronomy" in read.content[0].text
     assert proposal.is_error is False and '"id":9' in proposal.content[0].text.replace(" ", "")
     assert invalid.is_error is True

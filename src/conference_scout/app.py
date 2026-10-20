@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from datetime import UTC, date, datetime, timedelta
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -17,19 +18,40 @@ from conference_scout.agent.runtime import AgentRuntime
 from conference_scout.ai.active_provider import ActiveLLMProvider
 from conference_scout.ai.registry import ModelRegistry, ProviderProfile, build_provider_profiles
 from conference_scout.ai.service import AIService
+from conference_scout.ai.usage import OllamaUsageService
 from conference_scout.bot.dependencies import RepositoryMiddleware
 from conference_scout.bot.router import build_router
+from conference_scout.conferences.deduplication import normalize_name
 from conference_scout.conferences.discovery import DiscoveryService
-from conference_scout.conferences.monitoring import MonitoringService
+from conference_scout.conferences.evidence import EvidenceDocument, EvidenceValidator
+from conference_scout.conferences.monitoring import (
+    CatalogConversion,
+    MonitoringCheckError,
+    MonitoringService,
+)
+from conference_scout.conferences.persistence import ConferencePersistenceService
+from conference_scout.conferences.research import ConferenceResearchService
 from conference_scout.config import Settings
 from conference_scout.db.migrations import run_migrations
-from conference_scout.db.models import Conference, ConferenceTopic, Deadline, Subscription, Topic
+from conference_scout.db.models import (
+    Conference,
+    ConferenceChange,
+    ConferenceEvidence,
+    ConferenceTopic,
+    Subscription,
+    Topic,
+)
 from conference_scout.db.repositories.agent_state import AgentStateRepository
+from conference_scout.db.repositories.agent_workflows import AgentWorkflowRepository
+from conference_scout.db.repositories.conference_research import ConferenceResearchRepository
 from conference_scout.db.repositories.conferences import ConferenceRepository
 from conference_scout.db.repositories.memories import MemoryRepository
+from conference_scout.db.repositories.ollama_usage import OllamaUsageRepository
+from conference_scout.db.repositories.parser_recipes import ParserRecipeRepository
 from conference_scout.db.repositories.reminders import ReminderRepository
 from conference_scout.db.repositories.sources import SourceRepository
 from conference_scout.db.repositories.topics import TopicRepository
+from conference_scout.db.repositories.web_cache import WebDocumentCacheRepository
 from conference_scout.db.session import create_engine_and_sessionmaker
 from conference_scout.mcp.client import StreamableHTTPToolClient
 from conference_scout.mcp.lifecycle import MCPServerLifecycle
@@ -37,52 +59,245 @@ from conference_scout.mcp.server import build_mcp_app, build_mcp_server
 from conference_scout.mcp.tools import MCPToolServices
 from conference_scout.owner import OwnerContext, bootstrap_owner
 from conference_scout.reminders.service import ReminderCandidate, ReminderService
+from conference_scout.runtime_clock import ApplicationClock
 from conference_scout.scheduler.setup import configure_scheduler
 from conference_scout.schemas.agent import (
     AddSourceAction,
     AddTopicAction,
     ArchiveConferenceAction,
     ForgetMemoryAction,
+    ImportConferenceCandidateAction,
+    ImportConferenceURLAction,
     MemoryProposal,
     RunDiscoveryAction,
     SaveMemoryAction,
+    SetCandidateDecisionAction,
     TrackConferenceAction,
+    UpsertDeadlineAction,
 )
-from conference_scout.schemas.common import ConferenceStatus
+from conference_scout.schemas.common import (
+    AgentTaskType,
+    ArtifactValidationState,
+    CandidateDecisionReason,
+    CandidateDecisionSource,
+    CandidateStatus,
+    ConferenceStatus,
+    EvidenceSourceClass,
+    ModelRole,
+    VerificationStatus,
+)
+from conference_scout.schemas.research import (
+    ConferenceResearch,
+    DeadlineClaim,
+)
 from conference_scout.schemas.topics import TopicNormalization
+from conference_scout.schemas.workflows import (
+    AgentRunView,
+    WorkflowBudget,
+    WorkflowPlan,
+    WorkflowTaskSpec,
+)
 from conference_scout.search.searxng import SearXNGSearchProvider
-from conference_scout.web.fetcher import PageFetcher
+from conference_scout.web.fetcher import PageFetcher, normalized_content_hash
 from conference_scout.web.parser import extract_page_text
+from conference_scout.web.reader import JinaPageReader
 from conference_scout.web.url_safety import URLSafetyPolicy
+from conference_scout.workflows.engine import (
+    TaskArtifact,
+    WorkflowEngine,
+    WorkflowTaskFailure,
+)
+from conference_scout.workflows.planner import WorkflowPlanner
+from conference_scout.workflows.progress import WorkflowProgress
 
 logger = logging.getLogger(__name__)
 
 
-class CandidateStore:
-    def __init__(self) -> None:
-        self._items: dict[str, dict[str, Any]] = {}
-        self._next_id = 1
+def _reader_fallback(settings: Settings, fetcher: PageFetcher) -> JinaPageReader | None:
+    if settings.reader_fallback_url is None:
+        return None
+    return JinaPageReader(fetcher.client, str(settings.reader_fallback_url))
 
-    def replace(self, results) -> list[dict[str, Any]]:
-        self._items.clear()
-        values = []
-        for result in results:
-            candidate_id = f"candidate-{self._next_id}"
-            self._next_id += 1
-            item = {
-                "kind": "event_candidate",
-                "id": candidate_id,
-                "title": result.title,
-                "url": str(result.url),
-                "snippet": result.snippet,
-                "provenance": {"engine": result.engine, "source_url": str(result.url)},
-            }
-            self._items[candidate_id] = item
-            values.append(item)
-        return values
 
-    def get(self, candidate_id: str) -> dict[str, Any] | None:
-        return self._items.get(candidate_id)
+def _model_registry(
+    session: AsyncSession,
+    profiles: Sequence[ProviderProfile],
+    *,
+    capability_timeout: float = 20,
+    settings: Settings | None = None,
+) -> ModelRegistry:
+    return ModelRegistry(
+        AgentStateRepository(session),
+        profiles,
+        usage_repository=OllamaUsageRepository(session),
+        capability_timeout=capability_timeout,
+        role_models=settings.model_role_overrides if settings is not None else None,
+    )
+
+
+def _research_ai_service(registry: ModelRegistry, user_id: int) -> AIService:
+    return AIService(
+        ActiveLLMProvider(registry, user_id, ModelRole.RESEARCH),
+        verifier_provider=ActiveLLMProvider(registry, user_id, ModelRole.VERIFIER),
+    )
+
+
+def _durable_conference_workflow(
+    session: AsyncSession,
+    user_id: int,
+    settings: Settings,
+    profiles: Sequence[ProviderProfile],
+    search,
+    fetcher,
+    application_clock: ApplicationClock,
+) -> tuple[WorkflowEngine, WorkflowProgress]:
+    registry = _model_registry(session, profiles, settings=settings)
+    ai = _research_ai_service(registry, user_id)
+    research = ConferenceResearchService(
+        session,
+        search,
+        fetcher,
+        ai,
+        max_page_bytes=settings.max_page_bytes,
+        max_page_chars=settings.max_page_text_chars,
+        application_clock=application_clock,
+        min_relevance_score=settings.min_relevance_score,
+    )
+    async def search_task(context):
+        years = context.task.input_data.get("years")
+        if isinstance(years, list) and all(isinstance(year, int) for year in years):
+            service = _discovery_service(
+                session, user_id, settings, registry, search, fetcher
+            )
+            report = await service.run(user_id, years=years)
+            return TaskArtifact(
+                artifact_kind="candidate_list",
+                payload={"candidate_ids": list(report.created_ids)},
+            )
+        query = str(context.task.input_data.get("query", context.run.request_text))
+        values = await research.search(user_id, query, limit=20)
+        return TaskArtifact(
+            artifact_kind="candidate_list",
+            payload={"candidate_ids": [item.id for item in values]},
+        )
+
+    async def crawl_task(context):
+        source_url = context.task.input_data.get("url")
+        candidate_id = None
+        if not source_url and "search" in context.dependencies:
+            ids = context.dependencies["search"].payload.get("candidate_ids", [])
+            if not ids:
+                raise WorkflowTaskFailure("NO_CANDIDATES", retryable=False)
+            candidate_id = int(ids[0])
+            source_url = (await research.get_candidate(user_id, candidate_id)).source_url
+        if not isinstance(source_url, str):
+            raise WorkflowTaskFailure("SOURCE_URL_MISSING", retryable=False)
+        page = await fetcher.fetch(source_url, max_bytes=settings.max_page_bytes)
+        text = extract_page_text(page.html, max_chars=settings.max_page_text_chars)
+        return TaskArtifact(
+            artifact_kind="evidence_document",
+            payload={"url": page.url, "text": text, "candidate_id": candidate_id},
+            source_hashes=(page.content_hash or normalized_content_hash(page.html),),
+            pages=1,
+            characters=len(text),
+        )
+
+    async def extract_task(context):
+        document = context.dependencies["crawl"].payload
+        result = await ai.extract_conference_research(
+            document["url"], document["text"], context.run.request_text
+        )
+        return TaskArtifact(
+            artifact_kind="conference_research",
+            payload={"research": result.model_dump(mode="json"), "document": document},
+            source_hashes=tuple(context.dependencies["crawl"].source_hashes),
+            model_calls=1,
+        )
+
+    async def verify_task(context):
+        extracted = context.dependencies["extract"].payload
+        document = extracted["document"]
+        verified = await ai.verify_conference_research(
+            ConferenceResearch.model_validate(extracted["research"]),
+            evidence_documents=((document["url"], document["text"]),),
+        )
+        validation = EvidenceValidator().validate(
+            verified, (EvidenceDocument(document["url"], document["text"]),)
+        )
+        if not validation.validated.facts and not validation.validated.deadlines:
+            raise WorkflowTaskFailure("NO_VERIFIED_FACTS", retryable=False)
+        return TaskArtifact(
+            artifact_kind="verified_conference",
+            payload={
+                "research": validation.validated.model_dump(mode="json"),
+                "candidate_id": document.get("candidate_id"),
+            },
+            source_hashes=tuple(context.dependencies["extract"].source_hashes),
+            validation_state=ArtifactValidationState.ACCEPTED,
+            model_calls=1,
+        )
+
+    async def propose_task(context):
+        verified = context.dependencies["verify"]
+        return TaskArtifact(
+            artifact_kind="conference_candidate",
+            payload=verified.payload,
+            source_hashes=tuple(verified.source_hashes),
+            validation_state=verified.validation_state,
+        )
+
+    repository = AgentWorkflowRepository(session)
+    return (
+        WorkflowEngine(
+            repository,
+            {
+                AgentTaskType.SEARCH_CANDIDATES: search_task,
+                AgentTaskType.CRAWL_CANDIDATE: crawl_task,
+                AgentTaskType.EXTRACT_RESEARCH: extract_task,
+                AgentTaskType.VERIFY_RESEARCH: verify_task,
+                AgentTaskType.PROPOSE_PERSISTENCE: propose_task,
+            },
+        ),
+        WorkflowProgress(repository),
+    )
+
+
+async def _run_scheduled_discovery(
+    session: AsyncSession,
+    user_id: int,
+    discovery_service,
+    *,
+    years: list[int],
+) -> tuple[int, ...]:
+    async def discover_task(_context):
+        report = await discovery_service.run(user_id, years=years)
+        return TaskArtifact(
+            artifact_kind="candidate_list",
+            payload={"candidate_ids": list(report.created_ids)},
+        )
+
+    repository = AgentWorkflowRepository(session)
+    plan = WorkflowPlan(
+        tasks=(
+            WorkflowTaskSpec(
+                task_id="scheduled_discovery",
+                task_type=AgentTaskType.SEARCH_CANDIDATES,
+                input_data={"years": years},
+            ),
+        )
+    )
+    run = await WorkflowEngine(
+        repository, {AgentTaskType.SEARCH_CANDIDATES: discover_task}
+    ).start(
+        user_id,
+        f"Фоновый поиск конференций за {', '.join(map(str, years))}",
+        plan,
+        budget=WorkflowBudget(max_tasks=1),
+    )
+    artifacts = await repository.list_artifacts(run.id)
+    if not artifacts:
+        return ()
+    return tuple(int(item) for item in artifacts[-1].payload.get("candidate_ids", []))
 
 
 class _MCPConfirmationProxy:
@@ -103,6 +318,7 @@ async def run_application(settings: Settings) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     await asyncio.to_thread(run_migrations, settings.database_url)
+    application_clock = ApplicationClock.start(settings.timezone)
     engine, session_factory = create_engine_and_sessionmaker(settings.database_url)
     bot = Bot(settings.telegram_bot_token.get_secret_value())
     try:
@@ -116,15 +332,14 @@ async def run_application(settings: Settings) -> None:
             profiles = build_provider_profiles(settings, web_client)
             fetcher = PageFetcher(web_client, URLSafetyPolicy())
             search = SearXNGSearchProvider(str(settings.searxng_url), web_client)
-            candidates = CandidateStore()
             read_handlers = _build_read_handlers(
                 session_factory,
                 owner,
                 profiles,
                 search=search,
                 fetcher=fetcher,
-                candidates=candidates,
                 settings=settings,
+                application_clock=application_clock,
             )
             mcp_server = build_mcp_server(
                 MCPToolServices(
@@ -152,6 +367,7 @@ async def run_application(settings: Settings) -> None:
                         tool_client,
                         search,
                         fetcher,
+                        application_clock,
                     )
     finally:
         await bot.session.close()
@@ -167,25 +383,50 @@ async def _run_bot(
     tool_client,
     search,
     fetcher,
+    application_clock: ApplicationClock,
 ) -> None:
     dispatcher = Dispatcher(storage=MemoryStorage())
     router = build_router(owner_telegram_id=owner.telegram_id)
 
     def services(session: AsyncSession) -> dict[str, Any]:
-        registry = ModelRegistry(
-            AgentStateRepository(session),
+        registry = _model_registry(
+            session,
             profiles,
             capability_timeout=min(20, settings.agent_timeout_seconds),
+            settings=settings,
         )
         memory = MemoryService(session, max_context_chars=settings.agent_max_context_chars)
         confirmation = ConfirmationService(
             session,
             executors=_build_action_executors(
-                session, owner.user_id, settings, registry, search, fetcher
+                session,
+                owner.user_id,
+                settings,
+                registry,
+                search,
+                fetcher,
+                application_clock,
             ),
         )
+        ai_service = AIService(ActiveLLMProvider(registry, owner.user_id))
+        research_ai_service = _research_ai_service(registry, owner.user_id)
+        workflow_engine = None
+        workflow_planner = None
+        if settings.agent_workflows_enabled:
+            workflow_engine, _progress = _durable_conference_workflow(
+                session,
+                owner.user_id,
+                settings,
+                profiles,
+                search,
+                fetcher,
+                application_clock,
+            )
+            workflow_planner = WorkflowPlanner()
         return {
             "model_registry": registry,
+            "application_clock": application_clock,
+            "ollama_usage_service": OllamaUsageService(OllamaUsageRepository(session), registry),
             "memory_service": memory,
             "confirmation_service": confirmation,
             "agent_runtime": AgentRuntime(
@@ -195,9 +436,35 @@ async def _run_bot(
                 max_steps=settings.agent_max_steps,
                 max_tool_calls_per_step=settings.agent_max_tool_calls_per_step,
                 timeout_seconds=settings.agent_timeout_seconds,
+                tracked_check_timeout_seconds=settings.tracked_check_timeout_seconds,
                 max_tool_result_chars=settings.agent_max_tool_result_chars,
+                workflow_planner=workflow_planner,
+                workflow_engine=workflow_engine,
+                application_clock=application_clock,
             ),
-            "ai_service": AIService(ActiveLLMProvider(registry, owner.user_id)),
+            "ai_service": ai_service,
+            "conference_research_service": ConferenceResearchService(
+                session,
+                search,
+                fetcher,
+                research_ai_service,
+                max_page_bytes=settings.max_page_bytes,
+                max_page_chars=settings.max_page_text_chars,
+                application_clock=application_clock,
+                min_relevance_score=settings.min_relevance_score,
+            ),
+            "monitoring_service": MonitoringService(
+                session,
+                fetcher,
+                research_ai_service,
+                settings.max_page_bytes,
+                settings.max_page_text_chars,
+                search,
+                cache=WebDocumentCacheRepository(session),
+                recipes=ParserRecipeRepository(session),
+                reader=_reader_fallback(settings, fetcher),
+                monitoring_interval_hours=settings.monitoring_interval_hours,
+            ),
         }
 
     middleware = RepositoryMiddleware(session_factory, owner.user_id, service_factory=services)
@@ -207,33 +474,64 @@ async def _run_bot(
 
     async def discovery_job() -> None:
         async with session_factory() as session:
-            registry = ModelRegistry(AgentStateRepository(session), profiles)
+            registry = _model_registry(session, profiles, settings=settings)
             service = _discovery_service(
                 session, owner.user_id, settings, registry, search, fetcher
             )
-            report = await service.run(
-                owner.user_id, years=[date.today().year, date.today().year + 1]
-            )
-            if report.created_ids:
+            current_year = application_clock.today().year
+            years = [current_year, current_year + 1]
+            if settings.agent_workflows_enabled:
+                created_ids = await _run_scheduled_discovery(
+                    session, owner.user_id, service, years=years
+                )
+            else:
+                report = await service.run(owner.user_id, years=years)
+                created_ids = tuple(report.created_ids)
+            if created_ids:
                 await bot.send_message(
                     owner.telegram_id,
-                    f"🔎 Найдено новых конференций: {len(report.created_ids)}",
+                    f"🔎 Найдено новых конференций: {len(created_ids)}",
                 )
 
     async def monitoring_job() -> None:
         async with session_factory() as session:
-            registry = ModelRegistry(AgentStateRepository(session), profiles)
-            ai = AIService(ActiveLLMProvider(registry, owner.user_id))
+            registry = _model_registry(session, profiles, settings=settings)
+            ai = _research_ai_service(registry, owner.user_id)
             report = await MonitoringService(
-                session, fetcher, ai, settings.max_page_bytes, settings.max_page_text_chars
+                session,
+                fetcher,
+                ai,
+                settings.max_page_bytes,
+                settings.max_page_text_chars,
+                search,
+                cache=WebDocumentCacheRepository(session),
+                recipes=ParserRecipeRepository(session),
+                reader=_reader_fallback(settings, fetcher),
+                monitoring_interval_hours=settings.monitoring_interval_hours,
             ).run(owner.user_id)
-            for change in report.changes:
+            for conversion in report.catalogs:
                 await bot.send_message(
                     owner.telegram_id,
-                    f"🔄 Изменился дедлайн\n\n{change.conference_name}\n"
-                    f"{change.old_date.isoformat()} → {change.new_date.isoformat()}\n"
-                    f"{change.source_url}",
+                    conversion.telegram_summary(),
                 )
+            for receipt in (*report.created, *report.changed):
+                await bot.send_message(
+                    owner.telegram_id,
+                    "Мониторинг конференций. " + receipt.telegram_summary(),
+                )
+            for receipt in report.conflicts:
+                await bot.send_message(
+                    owner.telegram_id,
+                    "Мониторинг обнаружил конфликт источников. Данные не изменены. "
+                    + receipt.telegram_summary(),
+                )
+            for failure in report.errors:
+                if failure.consecutive_failures >= 3:
+                    await bot.send_message(
+                        owner.telegram_id,
+                        f"Не удалось проверить конференцию {failure.conference_id} "
+                        f"{failure.consecutive_failures} раза подряд. Код: {failure.error_code}.",
+                    )
 
     async def reminder_job() -> None:
         async with session_factory() as session:
@@ -247,10 +545,35 @@ async def _run_bot(
                 )
 
             await ReminderService(repository, settings.reminder_days).process(
-                owner.user_id, date.today(), send
+                owner.user_id, application_clock.today(), send
             )
 
     scheduler = AsyncIOScheduler()
+
+    if settings.agent_workflows_enabled:
+        async with session_factory() as session:
+            engine, progress = _durable_conference_workflow(
+                session,
+                owner.user_id,
+                settings,
+                profiles,
+                search,
+                fetcher,
+                application_clock,
+            )
+            recovery = await engine.recover_incomplete_runs(progress)
+        if recovery.recovered_run_ids:
+            await bot.send_message(
+                owner.telegram_id,
+                "Восстановлены прерванные задачи: "
+                + ", ".join(map(str, recovery.recovered_run_ids)),
+            )
+        if recovery.failed_run_ids:
+            await bot.send_message(
+                owner.telegram_id,
+                "Не удалось восстановить задачи: "
+                + ", ".join(map(str, recovery.failed_run_ids)),
+            )
     configure_scheduler(
         scheduler,
         discovery_job=discovery_job,
@@ -269,15 +592,23 @@ async def _run_bot(
 
 
 def _build_action_executors(
-    session, owner_id: int, settings, registry, search, fetcher
+    session,
+    owner_id: int,
+    settings,
+    registry,
+    search,
+    fetcher,
+    application_clock: ApplicationClock | None = None,
 ) -> dict[str, Any]:
     async def add_topic(user_id: int, payload: AddTopicAction) -> str:
+        description = payload.description.strip() or payload.name
+        keywords = [item for item in payload.keywords if item.strip()] or [payload.name]
         await TopicRepository(session).create(
             user_id,
             TopicNormalization(
                 name=payload.name,
-                description=payload.description,
-                keywords=list(payload.keywords),
+                description=description,
+                keywords=keywords,
             ),
         )
         return "Тема добавлена."
@@ -291,6 +622,34 @@ def _build_action_executors(
         await repository.require_accessible(user_id, payload.conference_id)
         await repository.track(user_id, payload.conference_id)
         return "Конференция отслеживается."
+
+    async def import_candidate(
+        user_id: int,
+        payload: ImportConferenceCandidateAction | ImportConferenceURLAction,
+    ) -> str:
+        if isinstance(payload, ImportConferenceCandidateAction):
+            receipt = await ConferenceResearchService(
+                session,
+                search,
+                fetcher,
+                _research_ai_service(registry, owner_id),
+                max_page_bytes=settings.max_page_bytes,
+                max_page_chars=settings.max_page_text_chars,
+                application_clock=application_clock,
+                min_relevance_score=getattr(settings, "min_relevance_score", 0.5),
+            ).add(user_id, payload.candidate_id)
+            return receipt.telegram_summary()
+        service = _discovery_service(session, owner_id, settings, registry, search, fetcher)
+        conference_id = await service.import_candidate(
+            user_id, str(payload.source_url), expected_name=payload.title
+        )
+        repository = ConferenceRepository(session)
+        await repository.track(user_id, conference_id)
+        conference = await repository.require_accessible(user_id, conference_id)
+        message = f"Конференция «{conference.name}» сохранена и отслеживается."
+        if conference.last_checked_at is None:
+            message += " Страница пока не проверена; бот повторит проверку при мониторинге."
+        return message
 
     async def archive(user_id: int, payload: ArchiveConferenceAction) -> str:
         repository = ConferenceRepository(session)
@@ -317,14 +676,133 @@ def _build_action_executors(
         ).run(user_id, years=list(payload.years))
         return f"Поиск завершён. Новых конференций: {len(report.created_ids)}."
 
+    async def upsert_deadline(user_id: int, payload: UpsertDeadlineAction) -> str:
+        repository = ConferenceRepository(session)
+        conference = await repository.require_accessible(user_id, payload.conference_id)
+        source_url = str(payload.source_url) if payload.source_url else (
+            conference.website or conference.source_url
+        )
+        if not source_url:
+            raise ValueError("conference has no source URL")
+        tentative = payload.tentative or payload.source_url is None
+        claim = DeadlineClaim(
+            deadline_type=payload.deadline_type,
+            exact_date=payload.exact_date,
+            approximate_year=payload.approximate_year,
+            approximate_month=payload.approximate_month,
+            tentative=tentative,
+            source_url=source_url,
+            source_class=EvidenceSourceClass.SECONDARY,
+            excerpt="Дедлайн введён владельцем вручную и требует проверки источника.",
+            verification_status=VerificationStatus.TENTATIVE,
+        )
+        receipt = await ConferencePersistenceService(session).persist_deadline(
+            user_id,
+            conference.id,
+            claim,
+        )
+        if not receipt.committed:
+            raise RuntimeError("deadline persistence did not commit")
+        when = (
+            payload.exact_date.isoformat()
+            if payload.exact_date is not None
+            else f"{payload.approximate_year}"
+            + (
+                f"-{payload.approximate_month:02d}"
+                if payload.approximate_month is not None
+                else ""
+            )
+            + " (ориентировочно)"
+        )
+        field_name = f"deadline:{payload.deadline_type.value}"
+        changed = field_name in {*receipt.created_fields, *receipt.updated_fields}
+        current = next(
+            (
+                item
+                for item in receipt.deadlines
+                if item.deadline_type == payload.deadline_type
+            ),
+            None,
+        )
+        desired_is_current = current is not None and (
+            (
+                payload.exact_date is not None
+                and current.exact_date == payload.exact_date
+            )
+            or (
+                payload.exact_date is None
+                and current.exact_date is None
+                and current.approximate_year == payload.approximate_year
+                and current.approximate_month == payload.approximate_month
+            )
+        )
+        if changed:
+            outcome = "сохранён"
+        elif desired_is_current:
+            outcome = "уже был сохранён"
+        else:
+            outcome = "не изменён: в базе есть значение из более доверенного источника"
+        return (
+            f"Дедлайн {payload.deadline_type.value}: {when} {outcome} для "
+            f"«{conference.name}». Квитанция: conference_id={receipt.conference_id}, "
+            "committed=true."
+        )
+
+    async def set_candidate_decision(
+        user_id: int, payload: SetCandidateDecisionAction
+    ) -> str:
+        repository = ConferenceResearchRepository(session)
+        candidate = await repository.get_candidate(user_id, payload.candidate_id)
+        now = application_clock.now() if application_clock is not None else datetime.now(UTC)
+        decision = CandidateStatus(payload.decision)
+        if decision == CandidateStatus.ACTIVE:
+            if candidate.status not in {CandidateStatus.SKIPPED, CandidateStatus.REJECTED}:
+                raise ValueError("candidate is not deferred or rejected")
+            await repository.transition_candidate(
+                user_id,
+                candidate.id,
+                CandidateStatus.ACTIVE,
+                None,
+                CandidateDecisionSource.USER,
+                now,
+            )
+            message = f"Кандидат {candidate.id} возвращён в очередь."
+        elif decision == CandidateStatus.SKIPPED:
+            await repository.transition_candidate(
+                user_id,
+                candidate.id,
+                CandidateStatus.SKIPPED,
+                CandidateDecisionReason.USER_DEFERRED,
+                CandidateDecisionSource.USER,
+                now,
+                next_review_at=now + timedelta(days=7),
+            )
+            message = f"Кандидат {candidate.id} пропущен."
+        else:
+            await repository.transition_candidate(
+                user_id,
+                candidate.id,
+                CandidateStatus.REJECTED,
+                CandidateDecisionReason.USER_REJECTED,
+                CandidateDecisionSource.USER,
+                now,
+            )
+            message = f"Кандидат {candidate.id} отклонён."
+        await session.commit()
+        return message
+
     return {
         "add_topic": add_topic,
         "add_source": add_source,
         "track_conference": track,
+        "import_conference_candidate": import_candidate,
+        "import_conference_url": import_candidate,
         "archive_conference": archive,
         "save_memory": save_memory,
         "forget_memory": forget_memory,
         "run_discovery": run_discovery,
+        "upsert_deadline": upsert_deadline,
+        "set_candidate_decision": set_candidate_decision,
     }
 
 
@@ -333,7 +811,7 @@ def _discovery_service(session, owner_id, settings, registry, search, fetcher):
         session,
         search,
         fetcher,
-        AIService(ActiveLLMProvider(registry, owner_id)),
+        _research_ai_service(registry, owner_id),
         settings.min_relevance_score,
         settings.max_page_bytes,
         settings.max_page_text_chars,
@@ -347,8 +825,8 @@ def _build_read_handlers(
     *,
     search,
     fetcher,
-    candidates: CandidateStore,
     settings,
+    application_clock: ApplicationClock,
 ) -> dict[str, Any]:
     async def with_session(operation):
         async with session_factory() as session:
@@ -369,18 +847,33 @@ def _build_read_handlers(
 
     async def list_conferences(user_id: int, arguments: dict) -> dict:
         async def operation(session):
-            ids = await _accessible_conference_ids(session, user_id)
-            statement = select(Conference).where(Conference.id.in_(ids))
-            status = arguments.get("status")
-            if status:
-                statement = statement.where(Conference.status == ConferenceStatus(status.upper()))
-            values = list(
-                await session.scalars(
-                    statement.order_by(Conference.start_date).limit(arguments["limit"])
-                )
+            status_value = arguments.get("status")
+            status = ConferenceStatus(status_value.upper()) if status_value else None
+            values = await _list_accessible_conferences(
+                session,
+                user_id,
+                status=status,
+                limit=arguments["limit"],
             )
             return {
-                "items": [_conference_mapping(item) for item in values],
+                "items": [
+                    _conference_mapping(item, status=status) for item in values
+                ],
+                "provenance": {"source": "database"},
+            }
+
+        return await with_session(operation)
+
+    async def find_conferences(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            matches = await _find_accessible_conferences(
+                session,
+                user_id,
+                arguments["query"],
+                limit=arguments["limit"],
+            )
+            return {
+                "items": [_conference_mapping(item) for item in matches],
                 "provenance": {"source": "database"},
             }
 
@@ -395,31 +888,27 @@ def _build_read_handlers(
 
     async def deadlines(user_id: int, arguments: dict) -> dict:
         async def operation(session):
-            ids = await _accessible_conference_ids(session, user_id)
-            until = date.today() + timedelta(days=arguments["days"])
-            rows = await session.execute(
-                select(Deadline, Conference)
-                .join(Conference, Conference.id == Deadline.conference_id)
-                .where(
-                    Deadline.conference_id.in_(ids),
-                    Deadline.deadline_date >= date.today(),
-                    Deadline.deadline_date <= until,
-                )
-                .order_by(Deadline.deadline_date)
-                .limit(arguments["limit"])
+            today = application_clock.today()
+            until = today + timedelta(days=arguments["days"])
+            values = await ReminderRepository(session).upcoming(
+                user_id,
+                today,
+                until=until,
             )
             return {
                 "items": [
                     {
                         "kind": "deadline",
-                        "id": deadline.id,
-                        "conference_id": conference.id,
-                        "conference": conference.name,
-                        "date": deadline.deadline_date,
-                        "type": deadline.deadline_type.value,
-                        "provenance": {"source_url": deadline.source_url},
+                        "id": item.deadline_id,
+                        "conference": item.conference_name,
+                        "date": item.deadline_date,
+                        "approximate_year": item.approximate_year,
+                        "approximate_month": item.approximate_month,
+                        "tentative": item.tentative,
+                        "type": item.deadline_type,
+                        "provenance": {"source_url": item.source_url},
                     }
-                    for deadline, conference in rows
+                    for item in values[: arguments["limit"]]
                 ]
             }
 
@@ -452,9 +941,9 @@ def _build_read_handlers(
 
     async def active_model(user_id: int, _arguments: dict) -> dict:
         async def operation(session):
-            active = await ModelRegistry(AgentStateRepository(session), profiles).get_active(
-                user_id
-            )
+            active = await _model_registry(
+                session, profiles, settings=settings
+            ).get_active(user_id)
             return {
                 "profile_id": active.profile_id,
                 "model_name": active.model_name,
@@ -463,29 +952,323 @@ def _build_read_handlers(
 
         return await with_session(operation)
 
-    async def search_candidates(_user_id: int, arguments: dict) -> dict:
-        results = (await search.search(arguments["query"]))[: arguments["limit"]]
-        return {"items": candidates.replace(results)}
+    async def search_candidates(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            registry = _model_registry(session, profiles, settings=settings)
+            service = ConferenceResearchService(
+                session,
+                search,
+                fetcher,
+                _research_ai_service(registry, owner.user_id),
+                max_page_bytes=settings.max_page_bytes,
+                max_page_chars=settings.max_page_text_chars,
+                application_clock=application_clock,
+                min_relevance_score=settings.min_relevance_score,
+            )
+            values = await service.search(
+                user_id,
+                arguments["query"],
+                arguments["limit"],
+                page=arguments["page"],
+            )
+            return {
+                "items": [
+                    {
+                        "kind": "event_candidate",
+                        "id": item.id,
+                        "title": item.title,
+                        "url": item.source_url,
+                        "summary": item.summary,
+                        "verification_status": item.verification_status.value,
+                    }
+                    for item in values
+                ],
+                "new_count": service.last_search_new_count,
+                "page": arguments["page"],
+                "next_page": arguments["page"] + 1,
+                "has_more": bool(values),
+                "provenance": {"source": "searxng", "verification": "pending"},
+            }
 
-    async def inspect_candidate(_user_id: int, arguments: dict) -> dict:
-        candidate = candidates.get(arguments["candidate_id"])
-        if candidate is None:
-            raise ValueError("candidate not found")
-        page = await fetcher.fetch(candidate["url"], max_bytes=settings.max_page_bytes)
-        text = extract_page_text(page.html, max_chars=min(settings.max_page_text_chars, 8_000))
-        return {**candidate, "page_text": text, "observed_at": datetime.now(UTC)}
+        return await with_session(operation)
+
+    async def inspect_candidate(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            registry = _model_registry(session, profiles, settings=settings)
+            service = ConferenceResearchService(
+                session,
+                search,
+                fetcher,
+                _research_ai_service(registry, owner.user_id),
+                max_page_bytes=settings.max_page_bytes,
+                max_page_chars=settings.max_page_text_chars,
+                application_clock=application_clock,
+                min_relevance_score=settings.min_relevance_score,
+            )
+            candidate = await service.repository.get_candidate(user_id, arguments["candidate_id"])
+            research = await service.inspect(user_id, candidate.id)
+            return {
+                "kind": "event_candidate",
+                "id": candidate.id,
+                "title": candidate.title,
+                "url": candidate.source_url,
+                "research": research.model_dump(mode="json"),
+            }
+
+        return await with_session(operation)
+
+    async def conference_details(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            conference = await ConferenceRepository(session).require_accessible(
+                user_id, arguments["conference_id"]
+            )
+            deadlines = await ConferenceRepository(session).list_deadlines(conference.id)
+            evidence = list(
+                await session.scalars(
+                    select(ConferenceEvidence)
+                    .where(ConferenceEvidence.conference_id == conference.id)
+                    .order_by(ConferenceEvidence.observed_at.desc())
+                    .limit(20)
+                )
+            )
+            history = list(
+                await session.scalars(
+                    select(ConferenceChange)
+                    .where(ConferenceChange.conference_id == conference.id)
+                    .order_by(ConferenceChange.detected_at.desc())
+                    .limit(20)
+                )
+            )
+            return {
+                **_conference_mapping(conference),
+                "deadlines": [
+                    {
+                        "id": item.id,
+                        "type": item.deadline_type.value,
+                        "exact_date": item.deadline_date,
+                        "approximate_year": item.approximate_year,
+                        "approximate_month": item.approximate_month,
+                        "tentative": item.tentative,
+                        "source_url": item.source_url,
+                    }
+                    for item in deadlines
+                ],
+                "evidence": [
+                    {
+                        "id": item.id,
+                        "fact": item.fact_kind,
+                        "value": item.fact_value,
+                        "source_url": item.source_url,
+                        "status": item.verification_status.value,
+                    }
+                    for item in evidence
+                ],
+                "history": [
+                    {
+                        "id": item.id,
+                        "field": item.field_name,
+                        "old": item.old_value,
+                        "new": item.new_value,
+                        "source_url": item.source_url,
+                    }
+                    for item in history
+                ],
+            }
+
+        return await with_session(operation)
+
+    async def check_tracked(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            registry = _model_registry(session, profiles, settings=settings)
+            try:
+                receipt = await MonitoringService(
+                    session,
+                    fetcher,
+                    _research_ai_service(registry, owner.user_id),
+                    settings.max_page_bytes,
+                    settings.max_page_text_chars,
+                    search,
+                    cache=WebDocumentCacheRepository(session),
+                    recipes=ParserRecipeRepository(session),
+                    reader=_reader_fallback(settings, fetcher),
+                    monitoring_interval_hours=settings.monitoring_interval_hours,
+                ).check_conference(user_id, arguments["conference_id"])
+            except MonitoringCheckError as exc:
+                return _monitoring_failure_mapping(arguments["conference_id"], exc)
+            return _receipt_mapping(receipt)
+
+        return await with_session(operation)
+
+    async def start_conference_research(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            engine, progress = _durable_conference_workflow(
+                session,
+                user_id,
+                settings,
+                profiles,
+                search,
+                fetcher,
+                application_clock,
+            )
+            run = await engine.start(
+                user_id,
+                arguments["request_text"],
+                await WorkflowPlanner().plan(user_id, arguments["request_text"]),
+                progress,
+                budget=WorkflowBudget(max_tasks=20),
+            )
+            return run.model_dump(mode="json")
+
+        return await with_session(operation)
+
+    async def get_agent_run(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            run = await AgentWorkflowRepository(session).get_run(
+                user_id, arguments["run_id"]
+            )
+            return AgentRunView.model_validate(run).model_dump(mode="json")
+
+        return await with_session(operation)
+
+    async def list_agent_run_candidates(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            repository = AgentWorkflowRepository(session)
+            await repository.get_run(user_id, arguments["run_id"])
+            artifacts = [
+                item
+                for item in await repository.list_artifacts(arguments["run_id"])
+                if item.artifact_kind == "conference_candidate"
+            ][: arguments["limit"]]
+            return {
+                "items": [
+                    {
+                        "artifact_id": item.id,
+                        "validation_state": item.validation_state.value,
+                        **item.payload,
+                    }
+                    for item in artifacts
+                ]
+            }
+
+        return await with_session(operation)
+
+    async def cancel_agent_run(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            repository = AgentWorkflowRepository(session)
+            run = await WorkflowEngine(repository, {}).cancel(
+                user_id, arguments["run_id"]
+            )
+            return run.model_dump(mode="json")
+
+        return await with_session(operation)
+
+    async def persist_agent_candidate(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            repository = AgentWorkflowRepository(session)
+            await repository.get_run(user_id, arguments["run_id"])
+            artifact = next(
+                (
+                    item
+                    for item in await repository.list_artifacts(arguments["run_id"])
+                    if item.id == arguments["artifact_id"]
+                    and item.artifact_kind == "conference_candidate"
+                    and item.validation_state
+                    in {
+                        ArtifactValidationState.ACCEPTED,
+                        ArtifactValidationState.TENTATIVE,
+                    }
+                ),
+                None,
+            )
+            candidate_id = artifact.payload.get("candidate_id") if artifact else None
+            if isinstance(candidate_id, int):
+                return {"candidate_id": candidate_id}
+
+            research = artifact.payload.get("research") if artifact else None
+            if isinstance(research, dict):
+                title = research.get("name")
+                source_url = research.get("source_url")
+                if isinstance(title, str) and isinstance(source_url, str):
+                    return {"title": title, "source_url": source_url}
+            raise ValueError("candidate artifact not found")
+
+        return await with_session(operation)
+
+    async def list_agent_progress(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            repository = AgentWorkflowRepository(session)
+            await repository.get_run(user_id, arguments["run_id"])
+            events = (
+                await repository.list_progress_after(
+                    arguments["run_id"], arguments["after_sequence"]
+                )
+            )[: arguments["limit"]]
+            return {
+                "items": [
+                    {
+                        "sequence": item.sequence,
+                        "event_type": item.event_type.value,
+                        "message": item.message,
+                        "safe_data": item.safe_data,
+                    }
+                    for item in events
+                ]
+            }
+
+        return await with_session(operation)
+
+    async def list_candidate_decisions(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            status = CandidateStatus(arguments["status"])
+            if status not in {CandidateStatus.SKIPPED, CandidateStatus.REJECTED}:
+                raise ValueError("only hidden candidate decisions can be listed")
+            values = await ConferenceResearchRepository(session).list_candidates_by_statuses(
+                user_id,
+                [status],
+                limit=arguments["limit"],
+            )
+            return {
+                "items": [
+                    {
+                        "kind": "event_candidate",
+                        "id": item.id,
+                        "title": item.title,
+                        "url": item.source_url,
+                        "status": item.status.value,
+                        "reason": (
+                            item.decision_reason.value if item.decision_reason else None
+                        ),
+                        "decided_at": item.decision_at,
+                        "next_review_at": item.next_review_at,
+                    }
+                    for item in values
+                ],
+                "provenance": {"source": "database"},
+            }
+
+        return await with_session(operation)
 
     return {
         "list_topics": list_topics,
         "list_conferences": list_conferences,
+        "find_conferences": find_conferences,
         "get_conference_context": conference_context,
         "list_upcoming_deadlines": deadlines,
         "search_knowledge": search_knowledge,
         "find_related_conferences": related,
         "list_memories": memories,
         "get_active_model": active_model,
-        "search_event_candidates": search_candidates,
-        "inspect_event_candidate": inspect_candidate,
+        "search_conference_candidates": search_candidates,
+        "get_candidate": inspect_candidate,
+        "list_conference_details": conference_details,
+        "check_tracked_conference": check_tracked,
+        "start_conference_research": start_conference_research,
+        "get_agent_run": get_agent_run,
+        "list_agent_run_candidates": list_agent_run_candidates,
+        "cancel_agent_run": cancel_agent_run,
+        "propose_persist_agent_candidate": persist_agent_candidate,
+        "list_agent_progress": list_agent_progress,
+        "list_candidate_decisions": list_candidate_decisions,
     }
 
 
@@ -499,13 +1282,123 @@ async def _accessible_conference_ids(session: AsyncSession, user_id: int) -> set
     return set(await session.scalars(union(by_topic, by_subscription)))
 
 
-def _conference_mapping(conference: Conference) -> dict[str, Any]:
+async def _list_accessible_conferences(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    status: ConferenceStatus | None,
+    limit: int,
+) -> list[Conference]:
+    repository = ConferenceRepository(session)
+    if status is not None:
+        return (await repository.list_accessible_by_status(user_id, status))[:limit]
+    ids = await _accessible_conference_ids(session, user_id)
+    if not ids:
+        return []
+    return list(
+        await session.scalars(
+            select(Conference)
+            .where(Conference.id.in_(ids))
+            .order_by(Conference.start_date, Conference.id)
+            .limit(limit)
+        )
+    )
+
+
+async def _find_accessible_conferences(
+    session: AsyncSession,
+    user_id: int,
+    query: str,
+    *,
+    limit: int,
+) -> list[Conference]:
+    ids = await _accessible_conference_ids(session, user_id)
+    if not ids:
+        return []
+    needle = normalize_name(query)
+    values = list(
+        await session.scalars(select(Conference).where(Conference.id.in_(ids)))
+    )
+    matches = [
+        item
+        for item in values
+        if needle in item.normalized_name
+        or item.normalized_name in needle
+        or (item.acronym and needle in normalize_name(item.acronym))
+    ]
+    matches.sort(
+        key=lambda item: (
+            item.normalized_name != needle,
+            len(item.normalized_name),
+            item.id,
+        )
+    )
+    return matches[:limit]
+
+
+def _conference_mapping(
+    conference: Conference,
+    *,
+    status: ConferenceStatus | None = None,
+) -> dict[str, Any]:
     return {
         "kind": "conference",
         "id": conference.id,
         "name": conference.name,
         "start_date": conference.start_date,
         "location": conference.location,
-        "status": conference.status.value,
+        "status": (status or conference.status).value,
         "provenance": {"source_url": conference.source_url},
+    }
+
+
+def _receipt_mapping(receipt) -> dict[str, Any]:
+    if isinstance(receipt, CatalogConversion):
+        return {
+            "kind": "catalog_conversion",
+            "committed": receipt.committed,
+            "conference_id": receipt.conference_id,
+            "conference_name": receipt.conference_name,
+            "source_url": receipt.source_url,
+            "candidate_ids": list(receipt.candidate_ids),
+            "summary": receipt.telegram_summary(),
+        }
+    return {
+        "kind": "persistence_receipt",
+        "committed": receipt.committed,
+        "conference_id": receipt.conference_id,
+        "conference_name": receipt.conference_name,
+        "created": receipt.created,
+        "tracked": receipt.tracked,
+        "created_fields": list(receipt.created_fields),
+        "updated_fields": list(receipt.updated_fields),
+        "deadline_ids": [item.id for item in receipt.deadlines],
+        "evidence_ids": list(receipt.evidence_ids),
+        "change_ids": list(receipt.change_ids),
+        "summary": receipt.telegram_summary(),
+    }
+
+
+def _monitoring_failure_mapping(
+    conference_id: int, error: MonitoringCheckError
+) -> dict[str, Any]:
+    code = str(error)
+    if code == "NO_TEMPORAL_DATA":
+        summary = (
+            "Страницы проверены, но подтверждённые даты проведения и дедлайны "
+            "не найдены. Данные не изменены. Код: NO_TEMPORAL_DATA."
+        )
+    elif code in {"NETWORK_ERROR", "TIMEOUT", "FetchError"}:
+        summary = (
+            "Не удалось открыть источники. Используемого снимка или поисковой "
+            f"карточки с датами нет. Данные не изменены. Код: {code}."
+        )
+    else:
+        summary = f"Проверка не завершена; данные не изменены. Код: {code}."
+    return {
+        "kind": "monitoring_failure",
+        "committed": False,
+        "conference_id": conference_id,
+        "error_code": code,
+        "summary": summary,
     }

@@ -9,24 +9,38 @@ from conference_scout.schemas.agent import ActionPayload, PendingActionView
 READ_TOOL_NAMES = {
     "list_topics",
     "list_conferences",
+    "find_conferences",
     "get_conference_context",
     "list_upcoming_deadlines",
     "search_knowledge",
     "find_related_conferences",
     "list_memories",
     "get_active_model",
-    "search_event_candidates",
-    "inspect_event_candidate",
+    "search_conference_candidates",
+    "get_candidate",
+    "list_conference_details",
+    "check_tracked_conference",
+    "start_conference_research",
+    "get_agent_run",
+    "list_agent_run_candidates",
+    "cancel_agent_run",
+    "propose_persist_agent_candidate",
+    "list_agent_progress",
+    "list_candidate_decisions",
 }
 
 PROPOSAL_TOOL_NAMES = {
     "propose_add_topic",
     "propose_add_source",
     "propose_track_conference",
+    "propose_add_candidate",
+    "propose_import_conference_url",
     "propose_archive_conference",
     "propose_save_memory",
     "propose_forget_memory",
     "propose_run_discovery",
+    "propose_upsert_deadline",
+    "propose_candidate_decision",
 }
 
 ReadHandler = Callable[[int, dict[str, Any]], Awaitable[Any]]
