@@ -17,6 +17,7 @@ from conference_scout.conferences.monitoring import MonitoringCheckError
 from conference_scout.conferences.research import (
     CandidateExpiredError,
     CandidateImportedError,
+    CandidateRejectedError,
     CandidateSkippedError,
     CandidateUnusableError,
     CatalogExpansion,
@@ -397,6 +398,8 @@ def stale_candidate_message(error: Exception) -> str:
         return "Срок действия кандидата истёк. Запустите поиск снова."
     if isinstance(error, CandidateSkippedError):
         return "Этот кандидат был пропущен."
+    if isinstance(error, CandidateRejectedError):
+        return "Этот кандидат был отклонён."
     if isinstance(error, CandidateImportedError):
         return "Этот кандидат уже добавлен."
     return "Кандидат не найден или больше недоступен."
@@ -466,8 +469,9 @@ def build_conference_router() -> Router:
         )
         await message.answer(deadline_list_text(values), parse_mode="HTML")
 
+    @router.callback_query(F.data.startswith("candidate:track:"))
     @router.callback_query(F.data.startswith("candidate:add:"))
-    async def candidate_add(
+    async def candidate_track(
         callback: CallbackQuery,
         confirmation_service,
         conference_research_service,
@@ -475,10 +479,30 @@ def build_conference_router() -> Router:
     ) -> None:
         candidate_id = int(callback.data.rsplit(":", 1)[1])
         try:
-            await conference_research_service.get_candidate(owner_user_id, candidate_id)
+            await conference_research_service.prepare_for_tracking(owner_user_id, candidate_id)
             pending = await confirmation_service.propose(
                 owner_user_id, ImportConferenceCandidateAction(candidate_id=candidate_id)
             )
+        except CandidateUnusableError:
+            await callback.answer(
+                "Не найдены подтверждённые даты проведения или дедлайны. "
+                "Кандидат остался в очереди.",
+                show_alert=True,
+            )
+            return
+        except FetchError as exc:
+            await callback.answer(
+                f"Не удалось открыть страницу: {exc.user_message} "
+                "Кандидат остался в очереди.",
+                show_alert=True,
+            )
+            return
+        except (AIResponseError, ModelGatewayError):
+            await callback.answer(
+                "Модель не смогла проверить кандидата. Он остался в очереди.",
+                show_alert=True,
+            )
+            return
         except ValueError as exc:
             await callback.answer(stale_candidate_message(exc), show_alert=True)
             return
@@ -494,17 +518,33 @@ def build_conference_router() -> Router:
             callback, conference_research_service, owner_user_id, candidate_id
         )
 
-    @router.callback_query(F.data.startswith("candidate:skip:"))
-    async def candidate_skip(
+    @router.callback_query(F.data.startswith("candidate:defer:"))
+    async def candidate_defer(
         callback: CallbackQuery, conference_research_service, owner_user_id: int
     ) -> None:
         candidate_id = int(callback.data.rsplit(":", 1)[1])
         try:
-            await conference_research_service.skip(owner_user_id, candidate_id)
+            await conference_research_service.defer(owner_user_id, candidate_id)
         except ValueError as exc:
             await callback.answer(stale_candidate_message(exc), show_alert=True)
             return
         await callback.answer("Кандидат пропущен.")
+        await send_next_candidate(
+            callback.message, conference_research_service.repository, owner_user_id
+        )
+
+    @router.callback_query(F.data.startswith("candidate:reject:"))
+    @router.callback_query(F.data.startswith("candidate:skip:"))
+    async def candidate_reject(
+        callback: CallbackQuery, conference_research_service, owner_user_id: int
+    ) -> None:
+        candidate_id = int(callback.data.rsplit(":", 1)[1])
+        try:
+            await conference_research_service.reject(owner_user_id, candidate_id)
+        except ValueError as exc:
+            await callback.answer(stale_candidate_message(exc), show_alert=True)
+            return
+        await callback.answer("Кандидат отклонён.")
         await send_next_candidate(
             callback.message, conference_research_service.repository, owner_user_id
         )

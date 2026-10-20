@@ -1,0 +1,1037 @@
+import re
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from difflib import SequenceMatcher
+from typing import ClassVar, Protocol
+from urllib.parse import urlsplit
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from conference_scout.conferences.candidate_policy import (
+    TopicRelevanceContext,
+    evaluate_keyword_relevance,
+    is_expired_research,
+)
+from conference_scout.conferences.deduplication import canonical_url, normalize_name
+from conference_scout.conferences.evidence import (
+    EvidenceDocument,
+    EvidenceValidator,
+    verification_required,
+)
+from conference_scout.conferences.persistence import (
+    ConferencePersistenceService,
+    PersistenceReceipt,
+)
+from conference_scout.conferences.roles import ResearchRole, VerifierRole
+from conference_scout.db.models import EventCandidate
+from conference_scout.db.repositories.conference_research import (
+    CandidateDraft,
+    ConferenceResearchRepository,
+)
+from conference_scout.db.repositories.topics import TopicRepository
+from conference_scout.runtime_clock import ApplicationClock
+from conference_scout.schemas.common import (
+    CandidateDecisionReason,
+    CandidateDecisionSource,
+    CandidateStatus,
+    EvidenceSourceClass,
+    VerificationStatus,
+)
+from conference_scout.schemas.research import (
+    ConferenceCatalogResearch,
+    ConferenceResearch,
+    FactClaim,
+    VerifiedConferenceResearch,
+)
+from conference_scout.schemas.topics import RelevanceAssessment
+from conference_scout.search.provider import SearchProvider
+from conference_scout.web.fetcher import FetchedPage, FetchError
+from conference_scout.web.parser import PageLink, extract_page_links, extract_page_text
+
+
+class CandidateExpiredError(ValueError):
+    pass
+
+
+class CandidateSkippedError(ValueError):
+    pass
+
+
+class CandidateRejectedError(ValueError):
+    pass
+
+
+class CandidateImportedError(ValueError):
+    pass
+
+
+class CandidateUnusableError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogExpansion:
+    parent_candidate_id: int
+    created_candidate_ids: tuple[int, ...]
+
+
+class Fetcher(Protocol):
+    async def fetch(self, url: str, *, max_bytes: int) -> FetchedPage: ...
+
+
+class ResearchAnalyzer(Protocol):
+    async def extract_conference_catalog(
+        self, source_url: str, text: str
+    ) -> ConferenceCatalogResearch: ...
+
+    async def extract_conference_research(
+        self, source_url: str, text: str, expected_name: str
+    ) -> ConferenceResearch: ...
+
+    async def verify_conference_research(
+        self, research: ConferenceResearch
+    ) -> VerifiedConferenceResearch: ...
+
+    async def rank_research_relevance(
+        self,
+        research: VerifiedConferenceResearch,
+        topics: tuple[TopicRelevanceContext, ...],
+    ) -> RelevanceAssessment: ...
+
+
+class ConferenceResearchService:
+    MAX_PAGE_RESULTS = 50
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        search: SearchProvider,
+        fetcher: Fetcher,
+        ai: ResearchAnalyzer,
+        *,
+        max_page_bytes: int,
+        max_page_chars: int,
+        candidate_ttl: timedelta = timedelta(days=7),
+        application_clock: ApplicationClock | None = None,
+        min_relevance_score: float = 0.5,
+    ) -> None:
+        self.session = session
+        self.search_provider = search
+        self.fetcher = fetcher
+        self.ai = ai
+        self.max_page_bytes = max_page_bytes
+        self.max_page_chars = max_page_chars
+        self.candidate_ttl = candidate_ttl
+        self.application_clock = application_clock
+        self.min_relevance_score = min_relevance_score
+        self.repository = ConferenceResearchRepository(session)
+        self.last_search_new_count = 0
+
+    async def search(
+        self, user_id: int, query: str, limit: int = 10, *, page: int = 1
+    ) -> list[EventCandidate]:
+        bounded_limit = max(1, min(limit, self.MAX_PAGE_RESULTS))
+        topics = await self._topic_contexts(user_id)
+        search_query = query
+        if self.application_clock is not None:
+            search_query = (
+                f"{query}. Текущая дата: {self.application_clock.today().isoformat()}. "
+                "Искать только ещё не завершившиеся научные мероприятия."
+            )
+        raw_results = (await self.search_provider.search(search_query, page=page))[:bounded_limit]
+        drafts: list[CandidateDraft] = []
+        seen_urls: set[str] = set()
+        for position, result in enumerate(raw_results):
+            url = str(result.url)
+            normalized_url = canonical_url(url) or url
+            if normalized_url in seen_urls:
+                continue
+            keyword_relevance = evaluate_keyword_relevance(
+                result.title, result.snippet, topics
+            )
+            if keyword_relevance.explicitly_irrelevant:
+                continue
+            seen_urls.add(normalized_url)
+            drafts.append(
+                CandidateDraft(
+                    title=result.title,
+                    source_url=url,
+                    query=query,
+                    relevance_score=(
+                        keyword_relevance.score
+                        if topics
+                        else max(0.0, 1.0 - position * 0.02)
+                    ),
+                    summary=result.snippet,
+                    verification_status=VerificationStatus.UNVERIFIABLE,
+                )
+            )
+        existing_identities = list(
+            (
+                await self.session.execute(
+                    select(EventCandidate.source_url, EventCandidate.normalized_title).where(
+                        EventCandidate.user_id == user_id,
+                        EventCandidate.source_url.in_([item.source_url for item in drafts]),
+                    )
+                )
+            ).tuples()
+        )
+        self.last_search_new_count = sum(
+            1
+            for item in drafts
+            if not self._candidate_identity_exists(item, existing_identities)
+        )
+        stored = await self.repository.create_candidates(
+            user_id,
+            drafts,
+            expires_at=datetime.now(UTC) + self.candidate_ttl,
+        )
+        await self.session.commit()
+        return [item for item in stored if item.status == CandidateStatus.ACTIVE]
+
+    async def inspect(
+        self, user_id: int, candidate_id: int
+    ) -> VerifiedConferenceResearch | CatalogExpansion:
+        candidate = await self.repository.get_candidate(user_id, candidate_id)
+        if candidate.status == CandidateStatus.SKIPPED and self._is_generic_title(candidate.title):
+            siblings = [
+                item
+                for item in await self.repository.list_candidates(user_id, limit=100)
+                if item.source_url == candidate.source_url and item.id != candidate.id
+            ]
+            if siblings:
+                return CatalogExpansion(candidate.id, tuple(item.id for item in siblings))
+        candidate = await self._require_active(user_id, candidate_id)
+        page, page_text, page_links = await self._fetch_candidate_page(candidate)
+        catalog_text = self._candidate_evidence_text(candidate, page_text)
+        catalog = await self._extract_catalog(page.url, catalog_text)
+        if catalog is not None:
+            catalog = self._downgrade_catalog_snippet_evidence(catalog, candidate.summary)
+        if catalog is not None and self._should_expand_catalog(candidate, catalog):
+            return await self._expand_catalog(candidate, catalog, page_links)
+        detail_link = (
+            self._best_event_link(candidate.title, page_links)
+            if catalog is not None and catalog.events
+            else None
+        )
+        if detail_link is not None and detail_link.url.rstrip("/") != page.url.rstrip("/"):
+            detail_page = await self.fetcher.fetch(
+                detail_link.url,
+                max_bytes=self.max_page_bytes,
+            )
+            page = detail_page
+            page_text = extract_page_text(page.html, max_chars=self.max_page_chars)
+            page_links = extract_page_links(page.html, page.url)
+            duplicate = await self.session.scalar(
+                select(EventCandidate.id).where(
+                    EventCandidate.user_id == candidate.user_id,
+                    EventCandidate.source_url == page.url,
+                    EventCandidate.normalized_title == candidate.normalized_title,
+                    EventCandidate.id != candidate.id,
+                )
+            )
+            if duplicate is None:
+                candidate.source_url = page.url
+                await self.session.commit()
+            catalog = None
+        return await self._research_candidate(
+            candidate,
+            page=page,
+            page_text=page_text,
+            page_links=page_links,
+            catalog=catalog,
+        )
+
+    async def get_candidate(self, user_id: int, candidate_id: int) -> EventCandidate:
+        return await self._require_active(user_id, candidate_id)
+
+    async def add(self, user_id: int, candidate_id: int) -> PersistenceReceipt:
+        candidate = await self._require_active(user_id, candidate_id)
+        verified = await self.repository.load_candidate_snapshot(user_id, candidate_id)
+        if verified is None:
+            verified = await self._research_candidate(candidate)
+        if is_expired_research(verified, self._today()):
+            await self.repository.transition_candidate(
+                user_id,
+                candidate_id,
+                CandidateStatus.EXPIRED,
+                CandidateDecisionReason.EVENT_ENDED,
+                CandidateDecisionSource.SYSTEM,
+                self._now(),
+            )
+            await self.session.commit()
+            raise CandidateExpiredError("event already ended")
+        if not self._is_usable_event(verified):
+            raise CandidateUnusableError("candidate has no event date or deadline evidence")
+        receipt = await ConferencePersistenceService(self.session).persist(
+            user_id, verified, track=True
+        )
+        if not receipt.committed:
+            raise RuntimeError("conference persistence did not commit")
+        await self.repository.transition_candidate(
+            user_id,
+            candidate_id,
+            CandidateStatus.IMPORTED,
+            None,
+            CandidateDecisionSource.SYSTEM,
+            self._now(),
+        )
+        await self.session.commit()
+        return receipt
+
+    async def prepare_for_tracking(self, user_id: int, candidate_id: int) -> EventCandidate:
+        candidate = await self._require_active(user_id, candidate_id)
+        snapshot = await self.repository.load_candidate_snapshot(user_id, candidate_id)
+        is_fresh = (
+            snapshot is not None
+            and candidate.researched_at is not None
+            and self._now() - candidate.researched_at <= self.candidate_ttl
+        )
+        if not is_fresh:
+            research = await self.inspect(user_id, candidate_id)
+            if isinstance(research, CatalogExpansion):
+                raise CandidateUnusableError("catalog expanded into concrete candidates")
+            candidate = await self.repository.get_candidate(user_id, candidate_id)
+        return candidate
+
+    async def defer(self, user_id: int, candidate_id: int) -> EventCandidate:
+        await self._require_active(user_id, candidate_id)
+        candidate = await self.repository.transition_candidate(
+            user_id,
+            candidate_id,
+            CandidateStatus.SKIPPED,
+            CandidateDecisionReason.USER_DEFERRED,
+            CandidateDecisionSource.USER,
+            self._now(),
+            next_review_at=self._now() + timedelta(days=7),
+        )
+        await self.session.commit()
+        return candidate
+
+    async def reject(self, user_id: int, candidate_id: int) -> EventCandidate:
+        await self._require_active(user_id, candidate_id)
+        candidate = await self.repository.transition_candidate(
+            user_id,
+            candidate_id,
+            CandidateStatus.REJECTED,
+            CandidateDecisionReason.USER_REJECTED,
+            CandidateDecisionSource.USER,
+            self._now(),
+        )
+        await self.session.commit()
+        return candidate
+
+    async def restore(self, user_id: int, candidate_id: int) -> EventCandidate:
+        candidate = await self.repository.get_candidate(user_id, candidate_id)
+        if candidate.status not in {CandidateStatus.SKIPPED, CandidateStatus.REJECTED}:
+            raise ValueError("candidate is not deferred or rejected")
+        candidate = await self.repository.transition_candidate(
+            user_id,
+            candidate_id,
+            CandidateStatus.ACTIVE,
+            None,
+            CandidateDecisionSource.USER,
+            self._now(),
+        )
+        await self.session.commit()
+        return candidate
+
+    async def skip(self, user_id: int, candidate_id: int) -> EventCandidate:
+        return await self.defer(user_id, candidate_id)
+
+    async def _require_active(self, user_id: int, candidate_id: int) -> EventCandidate:
+        candidate = await self.repository.get_candidate(user_id, candidate_id)
+        if candidate.status == CandidateStatus.SKIPPED:
+            raise CandidateSkippedError("candidate skipped")
+        if candidate.status == CandidateStatus.REJECTED:
+            raise CandidateRejectedError("candidate rejected")
+        if candidate.status == CandidateStatus.IMPORTED:
+            raise CandidateImportedError("candidate imported")
+        if candidate.status == CandidateStatus.EXPIRED or candidate.expires_at <= datetime.now(UTC):
+            await self.repository.transition_candidate(
+                user_id,
+                candidate_id,
+                CandidateStatus.EXPIRED,
+                CandidateDecisionReason.CANDIDATE_TTL_EXPIRED,
+                CandidateDecisionSource.SYSTEM,
+                self._now(),
+            )
+            await self.session.commit()
+            raise CandidateExpiredError("candidate expired")
+        return candidate
+
+    async def _research_candidate(
+        self,
+        candidate: EventCandidate,
+        *,
+        page: FetchedPage | None = None,
+        page_text: str | None = None,
+        page_links: tuple[PageLink, ...] | None = None,
+        catalog: ConferenceCatalogResearch | None = None,
+    ) -> VerifiedConferenceResearch:
+        if page is None or page_text is None or page_links is None:
+            page, page_text, page_links = await self._fetch_candidate_page(candidate)
+        if catalog is None:
+            catalog = await self._extract_catalog(
+                page.url,
+                self._candidate_evidence_text(candidate, page_text),
+            )
+            if catalog is not None:
+                catalog = self._downgrade_catalog_snippet_evidence(
+                    catalog, candidate.summary
+                )
+        documents, fetch_notes = await self._fetch_research_documents(
+            candidate,
+            page,
+            page_text,
+            page_links,
+        )
+        text = self._candidate_evidence_text(
+            candidate,
+            self._documents_text(documents),
+        )
+        if catalog is not None and catalog.events:
+            extracted, score = self._best_catalog_event(candidate.title, catalog.events)
+            if self._is_generic_title(candidate.title) or score < 0.45:
+                raise CandidateUnusableError("catalog candidate must be inspected first")
+            if len(documents) > 1:
+                detailed = await self.ai.extract_conference_research(
+                    page.url, text, candidate.title
+                )
+                extracted = self._merge_research(extracted, detailed)
+        else:
+            extracted = await ResearchRole(self.ai).extract(
+                (EvidenceDocument(page.url, text),), candidate.title
+            )
+        extracted = self._attribute_claim_sources(extracted, documents)
+        validator = EvidenceValidator()
+        needs_verification = any(
+            verification_required(claim, validator.context_for(claim, documents))
+            for claim in (*extracted.facts, *extracted.deadlines)
+        )
+        if needs_verification:
+            verified = await VerifierRole(self.ai).verify(extracted, documents)
+        else:
+            verified = VerifiedConferenceResearch.model_validate(
+                extracted.model_dump(mode="python")
+            )
+        verified = self._recover_visible_event_dates(
+            verified,
+            text,
+            candidate.title,
+            page.url,
+        )
+        verified = self._attribute_claim_sources(verified, documents)
+        if fetch_notes:
+            verified = verified.model_copy(
+                update={"verifier_notes": (*verified.verifier_notes, *fetch_notes)}
+            )
+        verified = self._downgrade_snippet_evidence(verified, candidate.summary)
+        validation = validator.validate(verified, documents)
+        rejected = tuple(
+            f"Доказательство отклонено: {item.claim_type} {item.claim_index} ({item.reason})"
+            for item in validation.results
+            if item.state.value in {"REJECTED", "CONFLICT"}
+        )
+        verified = validation.validated.model_copy(
+            update={"verifier_notes": (*validation.validated.verifier_notes, *rejected)[:20]}
+        )
+        if not self._is_usable_event(verified):
+            raise CandidateUnusableError("candidate has no event date or deadline evidence")
+        if is_expired_research(verified, self._today()):
+            await self.repository.transition_candidate(
+                candidate.user_id,
+                candidate.id,
+                CandidateStatus.EXPIRED,
+                CandidateDecisionReason.EVENT_ENDED,
+                CandidateDecisionSource.SYSTEM,
+                self._now(),
+            )
+            await self.session.commit()
+            raise CandidateExpiredError("event already ended")
+        topics = await self._topic_contexts(candidate.user_id)
+        relevance = (
+            await self.ai.rank_research_relevance(verified, topics)
+            if topics
+            else RelevanceAssessment(score=1.0, explanation="Темы не настроены")
+        )
+        candidate.topic_relevance_score = relevance.score
+        candidate.topic_relevance_reason = relevance.explanation
+        if relevance.score < self.min_relevance_score:
+            await self.repository.transition_candidate(
+                candidate.user_id,
+                candidate.id,
+                CandidateStatus.SKIPPED,
+                CandidateDecisionReason.LOW_RELEVANCE,
+                CandidateDecisionSource.SYSTEM,
+                self._now(),
+                next_review_at=self._now() + timedelta(days=7),
+            )
+            await self.session.commit()
+            raise CandidateUnusableError("candidate is not relevant to enabled topics")
+        candidate.title = verified.name
+        candidate.normalized_title = normalize_name(verified.name)
+        candidate.verification_status = self._candidate_verification_status(verified)
+        researched_at = (
+            self.application_clock.now()
+            if self.application_clock is not None
+            else datetime.now(UTC)
+        )
+        await self.repository.save_candidate_snapshot(
+            candidate.user_id,
+            candidate.id,
+            verified,
+            relevance,
+            researched_at,
+        )
+        await self.session.commit()
+        return verified
+
+    async def _topic_contexts(self, user_id: int) -> tuple[TopicRelevanceContext, ...]:
+        topics = await TopicRepository(self.session).list_for_user(user_id)
+        return tuple(
+            TopicRelevanceContext(
+                name=topic.name,
+                description=topic.description,
+                keywords=tuple(topic.keywords),
+            )
+            for topic in topics
+            if topic.enabled
+        )
+
+    def _today(self) -> date:
+        return self.application_clock.today() if self.application_clock else date.today()
+
+    def _now(self) -> datetime:
+        return self.application_clock.now() if self.application_clock else datetime.now(UTC)
+
+    async def _fetch_research_documents(
+        self,
+        candidate: EventCandidate,
+        page: FetchedPage,
+        page_text: str,
+        page_links: tuple[PageLink, ...],
+    ) -> tuple[tuple[EvidenceDocument, ...], tuple[str, ...]]:
+        primary_text = self._candidate_evidence_text(candidate, page_text)
+        documents = [EvidenceDocument(page.url, primary_text)]
+        notes: list[str] = []
+        ranked_links = self._relevant_research_links(candidate.title, page.url, page_links)
+        main_links = tuple(
+            link
+            for link in ranked_links
+            if self._research_link_score(candidate.title, link) > 0
+        )[:3]
+        reserve_links = tuple(link for link in ranked_links if link not in main_links)[:1]
+
+        async def fetch_link(link: PageLink) -> None:
+            try:
+                related = await self.fetcher.fetch(link.url, max_bytes=self.max_page_bytes)
+                related_text = extract_page_text(
+                    related.html,
+                    max_chars=self.max_page_chars,
+                )
+            except (FetchError, ValueError) as exc:
+                code = getattr(exc, "code", type(exc).__name__)
+                notes.append(f"Не удалось открыть связанную страницу {link.url}: {code}")
+                return
+            documents.append(EvidenceDocument(related.url, related_text))
+
+        for link in main_links:
+            await fetch_link(link)
+        if reserve_links and not self._documents_have_temporal_evidence(documents):
+            await fetch_link(reserve_links[0])
+        return tuple(documents), tuple(notes)
+
+    @staticmethod
+    def _documents_text(documents: tuple[EvidenceDocument, ...]) -> str:
+        return "\n\n".join(
+            f"DOCUMENT_URL: {document.url}\n"
+            f"DOCUMENT_TEXT:\n{document.text}\n"
+            "END_DOCUMENT"
+            for document in documents
+        )
+
+    @staticmethod
+    def _relevant_research_links(
+        expected_name: str,
+        page_url: str,
+        links: tuple[PageLink, ...],
+    ) -> tuple[PageLink, ...]:
+        ranked: list[tuple[int, int, PageLink]] = []
+        reserve: list[tuple[float, int, PageLink]] = []
+        seen_urls: set[str] = set()
+        page_host = urlsplit(page_url).netloc.casefold()
+        for position, link in enumerate(links):
+            if link.url.rstrip("/") == page_url.rstrip("/") or link.url in seen_urls:
+                continue
+            if urlsplit(link.url).netloc.casefold() != page_host:
+                continue
+            path = urlsplit(link.url).path.casefold()
+            if path.endswith((".pdf", ".jpg", ".jpeg", ".png", ".webp")):
+                continue
+            seen_urls.add(link.url)
+            score = ConferenceResearchService._research_link_score(expected_name, link)
+            if score > 0:
+                ranked.append((score, -position, link))
+            else:
+                similarity = SequenceMatcher(
+                    None, normalize_name(expected_name), normalize_name(link.text)
+                ).ratio()
+                reserve.append((similarity, -position, link))
+        ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
+        reserve.sort(reverse=True, key=lambda item: (item[0], item[1]))
+        selected = [item[2] for item in ranked[:3]]
+        if reserve:
+            selected.append(reserve[0][2])
+        return tuple(selected)
+
+    @staticmethod
+    def _research_link_score(expected_name: str, link: PageLink) -> int:
+        markers = (
+            "important date",
+            "deadline",
+            "registration",
+            "abstract",
+            "call for paper",
+            "call for contribution",
+            "programme",
+            "program",
+            "schedule",
+            "venue",
+            "location",
+            "conference",
+            "meeting",
+            "важн дат",
+            "срок",
+            "регистрац",
+            "тезис",
+            "программ",
+            "место",
+            "конференц",
+        )
+        label = normalize_name(link.text)
+        url_text = normalize_name(link.url)
+        score = sum(3 for marker in markers if marker in label)
+        score += sum(1 for marker in markers if marker in url_text)
+        if SequenceMatcher(None, normalize_name(expected_name), label).ratio() >= 0.55:
+            score += 4
+        return score
+
+    @staticmethod
+    def _documents_have_temporal_evidence(documents: list[EvidenceDocument]) -> bool:
+        text = " ".join(document.text.casefold() for document in documents)
+        has_year = re.search(r"\b20\d{2}\b", text) is not None
+        has_marker = any(
+            marker in text
+            for marker in (
+                "deadline",
+                "important date",
+                "registration",
+                "abstract",
+                "дедлайн",
+                "срок",
+                "регистрац",
+                "тезис",
+            )
+        )
+        return has_year or has_marker
+
+    @staticmethod
+    def _merge_research(
+        catalog: ConferenceResearch,
+        detailed: ConferenceResearch,
+    ) -> ConferenceResearch:
+        facts = list(catalog.facts)
+        fact_keys = {(item.kind, item.value, item.excerpt) for item in facts}
+        for item in detailed.facts:
+            key = (item.kind, item.value, item.excerpt)
+            if key not in fact_keys:
+                fact_keys.add(key)
+                facts.append(item)
+        deadlines = list(catalog.deadlines)
+        deadline_keys = {
+            (item.deadline_type, item.exact_date, item.approximate_year, item.approximate_month)
+            for item in deadlines
+        }
+        for item in detailed.deadlines:
+            key = (
+                item.deadline_type,
+                item.exact_date,
+                item.approximate_year,
+                item.approximate_month,
+            )
+            if key not in deadline_keys:
+                deadline_keys.add(key)
+                deadlines.append(item)
+        return detailed.model_copy(
+            update={
+                "aliases": tuple(dict.fromkeys((*catalog.aliases, *detailed.aliases))),
+                "facts": tuple(facts),
+                "deadlines": tuple(deadlines),
+            }
+        )
+
+    @staticmethod
+    def _attribute_claim_sources(
+        research: VerifiedConferenceResearch,
+        documents: tuple[EvidenceDocument, ...],
+    ) -> VerifiedConferenceResearch:
+        def source_for(claim) -> str:
+            excerpt = " ".join(claim.excerpt.casefold().split())
+            matches = [
+                document.url
+                for document in documents
+                if excerpt and excerpt in " ".join(document.text.casefold().split())
+            ]
+            return matches[-1] if matches else str(claim.source_url)
+
+        facts = tuple(
+            FactClaim.model_validate(
+                {**claim.model_dump(mode="python"), "source_url": source_for(claim)}
+            )
+            for claim in research.facts
+        )
+        deadlines = tuple(
+            type(claim).model_validate(
+                {**claim.model_dump(mode="python"), "source_url": source_for(claim)}
+            )
+            for claim in research.deadlines
+        )
+        return research.model_copy(update={"facts": facts, "deadlines": deadlines})
+
+    _MONTHS: ClassVar[dict[str, int]] = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+    _MONTH_DATE_RANGE: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(?P<month>January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+"
+        r"(?P<start>\d{1,2})\s*[\-–—]\s*(?P<end>\d{1,2})\s*,?\s*"
+        r"(?P<year>20\d{2})\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _recover_visible_event_dates(
+        cls,
+        research: VerifiedConferenceResearch,
+        evidence_text: str,
+        expected_name: str,
+        source_url: str,
+    ) -> VerifiedConferenceResearch:
+        if any(
+            fact.kind.casefold() in {"start_date", "end_date", "event_dates", "event_date"}
+            for fact in research.facts
+        ):
+            return research
+
+        page_text = evidence_text.rsplit("FETCHED_PAGE_TEXT:\n", maxsplit=1)[-1]
+        lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+        if not lines:
+            return research
+
+        expected = normalize_name(expected_name)
+        anchor_indexes = [
+            index
+            for index, line in enumerate(lines)
+            if SequenceMatcher(None, expected, normalize_name(line)).ratio() >= 0.55
+        ]
+        if not anchor_indexes:
+            return research
+
+        selected: tuple[int, re.Match[str]] | None = None
+        for anchor in anchor_indexes:
+            for index in range(max(0, anchor - 2), min(len(lines), anchor + 5)):
+                match = cls._MONTH_DATE_RANGE.search(lines[index])
+                if match is None:
+                    continue
+                distance = abs(index - anchor)
+                if selected is None or distance < selected[0]:
+                    selected = distance, match
+        if selected is None:
+            return research
+
+        match = selected[1]
+        month = cls._MONTHS[match.group("month").casefold()]
+        year = int(match.group("year"))
+        try:
+            start = date(year, month, int(match.group("start")))
+            end = date(year, month, int(match.group("end")))
+        except ValueError:
+            return research
+        if end < start:
+            return research
+
+        source_class = research.source_class
+        verification_status = {
+            EvidenceSourceClass.OFFICIAL_CONFERENCE: VerificationStatus.OFFICIAL_CONFIRMED,
+            EvidenceSourceClass.OFFICIAL_ORGANIZER: VerificationStatus.ORGANIZER_CONFIRMED,
+            EvidenceSourceClass.SECONDARY: VerificationStatus.SECONDARY_UNVERIFIED,
+        }[source_class]
+        excerpt = match.string.strip()
+        recovered = (
+            FactClaim(
+                kind="start_date",
+                value=start.isoformat(),
+                source_url=source_url,
+                source_class=source_class,
+                excerpt=excerpt,
+                verification_status=verification_status,
+            ),
+            FactClaim(
+                kind="end_date",
+                value=end.isoformat(),
+                source_url=source_url,
+                source_class=source_class,
+                excerpt=excerpt,
+                verification_status=verification_status,
+            ),
+        )
+        return research.model_copy(update={"facts": (*research.facts, *recovered)})
+
+    async def _fetch_candidate_page(
+        self, candidate: EventCandidate
+    ) -> tuple[FetchedPage, str, tuple[PageLink, ...]]:
+        page = await self.fetcher.fetch(candidate.source_url, max_bytes=self.max_page_bytes)
+        text = extract_page_text(page.html, max_chars=self.max_page_chars)
+        links = extract_page_links(page.html, page.url)
+        return page, text, links
+
+    @staticmethod
+    def _candidate_evidence_text(candidate: EventCandidate, page_text: str) -> str:
+        summary = candidate.summary or ""
+        return (
+            "SEARCH_RESULT_CONTEXT (secondary, unverified):\n"
+            f"Title: {candidate.title}\n"
+            f"Snippet: {summary}\n"
+            "END_SEARCH_RESULT_CONTEXT\n\n"
+            "FETCHED_PAGE_TEXT:\n"
+            f"{page_text}"
+        )
+
+    @classmethod
+    def _downgrade_catalog_snippet_evidence(
+        cls,
+        catalog: ConferenceCatalogResearch,
+        summary: str | None,
+    ) -> ConferenceCatalogResearch:
+        if not summary:
+            return catalog
+        return catalog.model_copy(
+            update={
+                "events": tuple(
+                    cls._downgrade_snippet_evidence(event, summary)
+                    for event in catalog.events
+                )
+            }
+        )
+
+    @staticmethod
+    def _downgrade_snippet_evidence(research, summary: str | None):
+        if not summary:
+            return research
+        normalized_summary = " ".join(summary.casefold().split())
+
+        def from_snippet(claim) -> bool:
+            excerpt = " ".join(claim.excerpt.casefold().split())
+            return bool(excerpt) and excerpt in normalized_summary
+
+        facts = tuple(
+            claim.model_copy(
+                update={
+                    "source_class": EvidenceSourceClass.SECONDARY,
+                    "verification_status": VerificationStatus.SECONDARY_UNVERIFIED,
+                }
+            )
+            if from_snippet(claim)
+            else claim
+            for claim in research.facts
+        )
+        deadlines = tuple(
+            claim.model_copy(
+                update={
+                    "source_class": EvidenceSourceClass.SECONDARY,
+                    "verification_status": (
+                        VerificationStatus.TENTATIVE
+                        if claim.tentative
+                        else VerificationStatus.SECONDARY_UNVERIFIED
+                    ),
+                }
+            )
+            if from_snippet(claim)
+            else claim
+            for claim in research.deadlines
+        )
+        return research.model_copy(update={"facts": facts, "deadlines": deadlines})
+
+    async def _extract_catalog(
+        self, source_url: str, text: str
+    ) -> ConferenceCatalogResearch | None:
+        extractor = getattr(self.ai, "extract_conference_catalog", None)
+        if extractor is None:
+            return None
+        return await extractor(source_url, text)
+
+    async def _expand_catalog(
+        self,
+        parent: EventCandidate,
+        catalog: ConferenceCatalogResearch,
+        page_links: tuple[PageLink, ...],
+    ) -> CatalogExpansion:
+        usable_events = [event for event in catalog.events if self._is_usable_event(event)]
+        if not usable_events:
+            raise CandidateUnusableError("catalog contains no concrete events with dates")
+        drafts = [
+            CandidateDraft(
+                title=event.name,
+                source_url=(
+                    matched.url
+                    if (matched := self._best_event_link(event.name, page_links)) is not None
+                    else parent.source_url
+                ),
+                query=parent.query,
+                relevance_score=parent.relevance_score,
+                verification_status=self._candidate_verification_status(event),
+                summary=self._event_summary(event),
+            )
+            for event in usable_events
+        ]
+        children = await self.repository.create_candidates(
+            parent.user_id,
+            drafts,
+            expires_at=parent.expires_at,
+        )
+        child_ids = tuple(item.id for item in children if item.id != parent.id)
+        if not child_ids:
+            raise CandidateUnusableError("catalog contains no new concrete events")
+        await self.repository.transition_candidate(
+            parent.user_id,
+            parent.id,
+            CandidateStatus.SKIPPED,
+            CandidateDecisionReason.CATALOG_EXPANDED,
+            CandidateDecisionSource.SYSTEM,
+            self._now(),
+        )
+        await self.session.commit()
+        return CatalogExpansion(parent.id, child_ids)
+
+    @staticmethod
+    def _best_event_link(
+        event_name: str,
+        links: tuple[PageLink, ...],
+    ) -> PageLink | None:
+        expected = normalize_name(event_name)
+        if not expected:
+            return None
+
+        def score(link: PageLink) -> float:
+            label = normalize_name(link.text)
+            if label == expected:
+                return 1.0
+            if expected in label or label in expected:
+                return 0.9
+            return SequenceMatcher(None, expected, label).ratio()
+
+        candidates = [link for link in links if normalize_name(link.text)]
+        if not candidates:
+            return None
+        selected = max(candidates, key=score)
+        return selected if score(selected) >= 0.55 else None
+
+    @classmethod
+    def _should_expand_catalog(
+        cls,
+        candidate: EventCandidate,
+        catalog: ConferenceCatalogResearch,
+    ) -> bool:
+        if cls._is_generic_title(candidate.title):
+            return True
+        if len(catalog.events) <= 1:
+            return False
+        _event, score = cls._best_catalog_event(candidate.title, catalog.events)
+        return score < 0.55
+
+    @staticmethod
+    def _best_catalog_event(
+        candidate_title: str,
+        events: tuple[ConferenceResearch, ...],
+    ) -> tuple[ConferenceResearch, float]:
+        expected = normalize_name(candidate_title)
+
+        def score(event: ConferenceResearch) -> float:
+            return SequenceMatcher(None, expected, normalize_name(event.name)).ratio()
+
+        selected = max(events, key=score)
+        return selected, score(selected)
+
+    @staticmethod
+    def _is_generic_title(title: str) -> bool:
+        normalized = normalize_name(title)
+        markers = (
+            "объявления о конференц",
+            "список конференц",
+            "conference announcements",
+            "meeting announcements",
+            "conference calendar",
+            "events calendar",
+            "future meetings",
+            "upcoming meetings",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @classmethod
+    def _is_usable_event(cls, research: ConferenceResearch) -> bool:
+        if cls._is_generic_title(research.name):
+            return False
+        has_event_date = any(
+            fact.kind.casefold() in {"start_date", "end_date", "event_dates", "event_date"}
+            for fact in research.facts
+        )
+        return has_event_date or bool(research.deadlines)
+
+    @staticmethod
+    def _event_summary(research: ConferenceResearch) -> str | None:
+        excerpts = [item.excerpt for item in (*research.facts, *research.deadlines)]
+        return " | ".join(excerpts[:3])[:4_000] or None
+
+    @staticmethod
+    def _candidate_identity_exists(
+        draft: CandidateDraft,
+        identities: list[tuple[str, str]],
+    ) -> bool:
+        normalized_title = normalize_name(draft.title)
+        return any(
+            source_url == draft.source_url
+            and (
+                stored_title == normalized_title
+                or stored_title in normalized_title
+                or normalized_title in stored_title
+            )
+            for source_url, stored_title in identities
+        )
+
+    @staticmethod
+    def _candidate_verification_status(
+        research: ConferenceResearch,
+    ) -> VerificationStatus:
+        statuses = [item.verification_status for item in (*research.facts, *research.deadlines)]
+        for status in (
+            VerificationStatus.OFFICIAL_CONFIRMED,
+            VerificationStatus.ORGANIZER_CONFIRMED,
+            VerificationStatus.TENTATIVE,
+            VerificationStatus.SECONDARY_UNVERIFIED,
+        ):
+            if status in statuses:
+                return status
+        return VerificationStatus.UNVERIFIABLE

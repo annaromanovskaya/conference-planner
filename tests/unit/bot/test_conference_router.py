@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from conference_scout.bot.conference_router import (
+    build_conference_router,
     candidate_card,
     candidate_research_text,
     conference_details_text,
@@ -55,8 +56,15 @@ def test_candidate_card_escapes_untrusted_text_and_review_buttons_use_durable_id
     assert "Время проведения: не проверено" in text
     assert "Место: не найдено" in text
     assert "Дедлайны: не найдены" in text
-    assert callbacks == ["candidate:details:17", "candidate:skip:17"]
+    assert callbacks == [
+        "candidate:track:17",
+        "candidate:defer:17",
+        "candidate:reject:17",
+    ]
     assert urls == ["https://example.org/?a=1&b=2"]
+    assert [
+        button.text for row in markup.inline_keyboard for button in row
+    ] == ["Отслеживать", "Подробнее", "Пропустить", "Отклонить"]
 
     decision_markup = candidate_decision_actions(candidate.id, candidate.source_url)
     decision_callbacks = [
@@ -65,7 +73,122 @@ def test_candidate_card_escapes_untrusted_text_and_review_buttons_use_durable_id
         for button in row
         if button.callback_data
     ]
-    assert decision_callbacks == ["candidate:add:17", "candidate:skip:17"]
+    assert decision_callbacks == [
+        "candidate:track:17",
+        "candidate:defer:17",
+        "candidate:reject:17",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_candidate_track_prepares_before_creating_confirmation() -> None:
+    class Service:
+        def __init__(self):
+            self.calls = []
+
+        async def prepare_for_tracking(self, user_id, candidate_id):
+            self.calls.append((user_id, candidate_id))
+
+    class Confirmation:
+        def __init__(self):
+            self.payload = None
+
+        async def propose(self, user_id, payload):
+            assert user_id == 7
+            self.payload = payload
+            return SimpleNamespace(id=19, summary="Подтвердите отслеживание")
+
+    router = build_conference_router()
+    handler = next(
+        item.callback
+        for item in router.callback_query.handlers
+        if item.callback.__name__ == "candidate_track"
+    )
+    callback = _Callback()
+    callback.data = "candidate:track:17"
+    service, confirmation = Service(), Confirmation()
+
+    await handler(callback, confirmation, service, 7)
+
+    assert service.calls == [(7, 17)]
+    assert confirmation.payload.candidate_id == 17
+    assert callback.messages == ["Подтвердите отслеживание"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_track_does_not_confirm_unverifiable_candidate() -> None:
+    class Service:
+        async def prepare_for_tracking(self, _user_id, _candidate_id):
+            from conference_scout.conferences.research import CandidateUnusableError
+
+            raise CandidateUnusableError("missing dates")
+
+    class Confirmation:
+        async def propose(self, *_args):
+            raise AssertionError("confirmation must not be created")
+
+    router = build_conference_router()
+    handler = next(
+        item.callback
+        for item in router.callback_query.handlers
+        if item.callback.__name__ == "candidate_track"
+    )
+    callback = _Callback()
+    callback.data = "candidate:track:17"
+
+    await handler(callback, Confirmation(), Service(), 7)
+
+    assert callback.messages == []
+    assert callback.alerts[-1][1]["show_alert"] is True
+    assert "даты" in callback.alerts[-1][0].casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "callback_data", "method_name", "answer"),
+    [
+        ("candidate_defer", "candidate:defer:17", "defer", "Кандидат пропущен."),
+        ("candidate_reject", "candidate:reject:17", "reject", "Кандидат отклонён."),
+    ],
+)
+async def test_candidate_decision_shows_next_candidate(
+    handler_name: str,
+    callback_data: str,
+    method_name: str,
+    answer: str,
+) -> None:
+    class Repository:
+        async def list_candidates(self, _user_id, _status, *, limit):
+            assert limit == 1
+            return []
+
+    class Service:
+        repository = Repository()
+
+        def __init__(self):
+            self.calls = []
+
+        async def defer(self, user_id, candidate_id):
+            self.calls.append(("defer", user_id, candidate_id))
+
+        async def reject(self, user_id, candidate_id):
+            self.calls.append(("reject", user_id, candidate_id))
+
+    router = build_conference_router()
+    handler = next(
+        item.callback
+        for item in router.callback_query.handlers
+        if item.callback.__name__ == handler_name
+    )
+    callback = _Callback()
+    callback.data = callback_data
+    service = Service()
+
+    await handler(callback, service, 7)
+
+    assert service.calls == [(method_name, 7, 17)]
+    assert callback.alerts[0][0] == answer
+    assert callback.messages == ["Новых кандидатов для рассмотрения нет."]
 
 
 def test_verified_candidate_card_shows_snapshot_dates_place_relevance_and_deadlines() -> None:
@@ -342,7 +465,11 @@ async def test_conference_overview_does_not_send_every_tracked_conference_as_a_c
         for button in row
         if button.callback_data
     ]
-    assert callbacks == ["candidate:details:7", "candidate:skip:7"]
+    assert callbacks == [
+        "candidate:track:7",
+        "candidate:defer:7",
+        "candidate:reject:7",
+    ]
 
 
 @pytest.mark.asyncio
@@ -463,7 +590,7 @@ async def test_candidate_details_separates_event_dates_and_deadlines(
         for button in row
         if button.callback_data
     ]
-    assert "candidate:add:7" in callbacks
+    assert "candidate:track:7" in callbacks
 
 
 def test_candidate_research_text_reports_unavailable_related_pages() -> None:
