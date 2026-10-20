@@ -408,3 +408,44 @@ def test_candidate_decision_migration_marks_legacy_skipped_without_reactivating(
     assert legacy.decision_source == "SYSTEM"
     assert str(legacy.decision_at).startswith("2026-10-20 01:02:03")
     assert legacy.next_review_at is None
+
+
+def test_workflow_kind_migration_marks_existing_research_runs(tmp_path: Path) -> None:
+    database = tmp_path / "workflow-kind.db"
+    config = _alembic_config(database)
+    command.upgrade(config, "20261020_0011")
+    engine = create_engine(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        # Historical workflow migration builds tables from current metadata in
+        # tests, so remove the future column to reproduce a real 0011 database.
+        connection.exec_driver_sql("DROP INDEX IF EXISTS ix_agent_runs_workflow_kind")
+        connection.exec_driver_sql("ALTER TABLE agent_runs DROP COLUMN workflow_kind")
+        connection.execute(
+            text(
+                "INSERT INTO users (id, telegram_id, created_at) "
+                "VALUES (1, 123, '2026-10-20 00:00:00')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs "
+                "(id, user_id, request_text, status, plan, budget, usage, error_code, "
+                "created_at, updated_at) VALUES "
+                "(7, 1, 'legacy research', 'COMPLETED', '{}', '{}', '{}', NULL, "
+                "'2026-10-20 00:00:00', '2026-10-20 00:00:00')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    migrated = create_engine(f"sqlite:///{database}")
+    columns = {item["name"] for item in inspect(migrated).get_columns("agent_runs")}
+    with migrated.connect() as connection:
+        kind = connection.scalar(
+            text("SELECT workflow_kind FROM agent_runs WHERE id = 7")
+        )
+    migrated.dispose()
+
+    assert "workflow_kind" in columns
+    assert kind == "conference_research"

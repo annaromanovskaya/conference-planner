@@ -124,6 +124,11 @@ class AgentRunStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class WorkflowKind(StrEnum):
+    CONFERENCE_RESEARCH = "conference_research"
+    CONFERENCE_CYCLE = "conference_cycle"
+
+
 class AgentTaskStatus(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -133,6 +138,8 @@ class AgentTaskStatus(StrEnum):
 
 
 class AgentTaskType(StrEnum):
+    CHECK_TRACKED_CONFERENCES = "CHECK_TRACKED_CONFERENCES"
+    RECHECK_SKIPPED_CANDIDATES = "RECHECK_SKIPPED_CANDIDATES"
     SEARCH_CANDIDATES = "SEARCH_CANDIDATES"
     CRAWL_CANDIDATE = "CRAWL_CANDIDATE"
     APPLY_PARSER_RECIPE = "APPLY_PARSER_RECIPE"

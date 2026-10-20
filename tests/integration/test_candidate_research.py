@@ -19,6 +19,7 @@ from conference_scout.db.repositories.conference_research import ConferenceResea
 from conference_scout.db.repositories.reminders import ReminderRepository
 from conference_scout.db.repositories.topics import TopicRepository
 from conference_scout.db.repositories.users import UserRepository
+from conference_scout.db.repositories.web_cache import WebDocumentCacheRepository
 from conference_scout.db.session import create_engine_and_sessionmaker
 from conference_scout.runtime_clock import ApplicationClock
 from conference_scout.schemas.common import CandidateDecisionReason, CandidateStatus
@@ -29,7 +30,7 @@ from conference_scout.schemas.research import (
     VerifiedConferenceResearch,
 )
 from conference_scout.schemas.topics import RelevanceAssessment, TopicNormalization
-from conference_scout.web.fetcher import FetchedPage, FetchError
+from conference_scout.web.fetcher import FetchedPage, FetchError, normalized_content_hash
 
 
 class FakeSearch:
@@ -181,6 +182,7 @@ def _service(
     ai=None,
     application_clock=None,
     min_relevance_score: float = 0.5,
+    cache=None,
 ) -> ConferenceResearchService:
     return ConferenceResearchService(
         session,
@@ -192,6 +194,7 @@ def _service(
         candidate_ttl=timedelta(days=2),
         application_clock=application_clock,
         min_relevance_score=min_relevance_score,
+        cache=cache,
     )
 
 
@@ -537,6 +540,96 @@ async def test_fresh_search_never_reactivates_rejected_candidate(
     assert rejected.status == CandidateStatus.REJECTED
     assert rejected.id not in report.active_ids
     assert len(report.new_ids) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("not_modified", [True, False])
+async def test_recheck_skipped_avoids_model_for_unchanged_document(
+    session: AsyncSession,
+    not_modified: bool,
+) -> None:
+    owner = await UserRepository(session).get_or_create_by_telegram_id(
+        5_040 + int(not_modified)
+    )
+    cache = WebDocumentCacheRepository(session)
+    url = "https://catalog.example/imbase-2027"
+    old_html = "<h1>ImBaSE 2027</h1><p>Old dates</p>"
+    old_hash = normalized_content_hash(old_html)
+    await cache.store(
+        FetchedPage(
+            url,
+            old_html,
+            etag='"old"',
+            last_modified="Tue, 20 Oct 2026 10:00:00 GMT",
+            content_hash=old_hash,
+        ),
+        "ImBaSE 2027 Old dates",
+    )
+
+    class Fetcher:
+        async def fetch(
+            self, requested_url, *, max_bytes, etag=None, last_modified=None
+        ):
+            assert requested_url == url
+            assert etag == '"old"'
+            assert last_modified == "Tue, 20 Oct 2026 10:00:00 GMT"
+            if not_modified:
+                return FetchedPage(url, "", status_code=304, not_modified=True)
+            return FetchedPage(url, old_html, content_hash=old_hash)
+
+    class NoModel(FakeAI):
+        async def extract_conference_research(self, *_args, **_kwargs):
+            raise AssertionError("unchanged page must not call the model")
+
+    service = _service(session, fetcher=Fetcher(), ai=NoModel(), cache=cache)
+    candidate = (await service.search(owner.id, "IMBASE", limit=1))[0]
+    await service.defer(owner.id, candidate.id)
+
+    reactivated = await service.recheck_skipped(owner.id, candidate.id)
+
+    await session.refresh(candidate)
+    assert reactivated is False
+    assert candidate.status == CandidateStatus.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_recheck_skipped_reactivates_only_after_new_relevant_facts(
+    session: AsyncSession,
+) -> None:
+    owner = await UserRepository(session).get_or_create_by_telegram_id(5_042)
+    cache = WebDocumentCacheRepository(session)
+    url = "https://catalog.example/imbase-2027"
+    old_html = "<h1>ImBaSE 2027</h1><p>Dates to be announced</p>"
+    await cache.store(
+        FetchedPage(url, old_html, content_hash=normalized_content_hash(old_html)),
+        "ImBaSE 2027 Dates to be announced",
+    )
+
+    class ChangedFetcher:
+        async def fetch(self, requested_url, *, max_bytes, **_kwargs):
+            assert requested_url == url
+            html = "<h1>ImBaSE 2027</h1><p>July 12-16, 2027</p>"
+            return FetchedPage(
+                url,
+                html,
+                content_hash=normalized_content_hash(html),
+            )
+
+    service = _service(
+        session,
+        fetcher=ChangedFetcher(),
+        ai=FakeAI(),
+        cache=cache,
+    )
+    candidate = (await service.search(owner.id, "IMBASE", limit=1))[0]
+    await service.defer(owner.id, candidate.id)
+
+    reactivated = await service.recheck_skipped(owner.id, candidate.id)
+
+    await session.refresh(candidate)
+    assert reactivated is True
+    assert candidate.status == CandidateStatus.ACTIVE
+    assert candidate.start_date == date(2027, 7, 12)
 
 
 @pytest.mark.asyncio

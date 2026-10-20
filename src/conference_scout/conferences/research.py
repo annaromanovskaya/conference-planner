@@ -30,6 +30,7 @@ from conference_scout.db.repositories.conference_research import (
     ConferenceResearchRepository,
 )
 from conference_scout.db.repositories.topics import TopicRepository
+from conference_scout.db.repositories.web_cache import WebDocumentCacheRepository
 from conference_scout.runtime_clock import ApplicationClock
 from conference_scout.schemas.common import (
     CandidateDecisionReason,
@@ -46,7 +47,7 @@ from conference_scout.schemas.research import (
 )
 from conference_scout.schemas.topics import RelevanceAssessment
 from conference_scout.search.provider import SearchProvider
-from conference_scout.web.fetcher import FetchedPage, FetchError
+from conference_scout.web.fetcher import FetchedPage, FetchError, normalized_content_hash
 from conference_scout.web.parser import PageLink, extract_page_links, extract_page_text
 
 
@@ -124,6 +125,7 @@ class ConferenceResearchService:
         candidate_ttl: timedelta = timedelta(days=7),
         application_clock: ApplicationClock | None = None,
         min_relevance_score: float = 0.5,
+        cache: WebDocumentCacheRepository | None = None,
     ) -> None:
         self.session = session
         self.search_provider = search
@@ -135,6 +137,7 @@ class ConferenceResearchService:
         self.application_clock = application_clock
         self.min_relevance_score = min_relevance_score
         self.repository = ConferenceResearchRepository(session)
+        self.cache = cache or WebDocumentCacheRepository(session)
         self.last_search_new_count = 0
         self.last_search_new_ids: tuple[int, ...] = ()
         self.last_search_result_count = 0
@@ -407,6 +410,78 @@ class ConferenceResearchService:
         )
         await self.session.commit()
         return candidate
+
+    async def recheck_skipped(self, user_id: int, candidate_id: int) -> bool:
+        candidate = await self.repository.get_candidate(user_id, candidate_id)
+        if candidate.status != CandidateStatus.SKIPPED or candidate.decision_reason not in {
+            CandidateDecisionReason.USER_DEFERRED,
+            CandidateDecisionReason.LOW_RELEVANCE,
+        }:
+            return False
+
+        cached = await self.cache.get(candidate.source_url)
+        page = await self.fetcher.fetch(
+            candidate.source_url,
+            max_bytes=self.max_page_bytes,
+            etag=cached.etag if cached is not None else None,
+            last_modified=cached.last_modified if cached is not None else None,
+        )
+        if page.not_modified:
+            if cached is not None:
+                await self.cache.touch(
+                    cached,
+                    etag=page.etag,
+                    last_modified=page.last_modified,
+                )
+                await self.session.commit()
+            return False
+
+        content_hash = page.content_hash or normalized_content_hash(page.html)
+        if cached is not None and cached.content_hash == content_hash:
+            await self.cache.touch(
+                cached,
+                etag=page.etag,
+                last_modified=page.last_modified,
+                status_code=page.status_code,
+            )
+            await self.session.commit()
+            return False
+
+        page = FetchedPage(
+            page.url,
+            page.html,
+            status_code=page.status_code,
+            etag=page.etag,
+            last_modified=page.last_modified,
+            content_hash=content_hash,
+            not_modified=page.not_modified,
+        )
+        page_text = extract_page_text(page.html, max_chars=self.max_page_chars)
+        page_links = extract_page_links(page.html, page.url)
+        previous = await self.repository.load_candidate_snapshot(user_id, candidate_id)
+        await self.cache.store(page, page_text, observed_at=self._now())
+        verified = await self._research_candidate(
+            candidate,
+            page=page,
+            page_text=page_text,
+            page_links=page_links,
+        )
+        if self._research_signature(verified) == self._research_signature(previous):
+            await self.session.commit()
+            return False
+        if not self._research_signature(verified):
+            await self.session.commit()
+            return False
+        await self.repository.transition_candidate(
+            user_id,
+            candidate_id,
+            CandidateStatus.ACTIVE,
+            None,
+            CandidateDecisionSource.SYSTEM,
+            self._now(),
+        )
+        await self.session.commit()
+        return True
 
     async def skip(self, user_id: int, candidate_id: int) -> EventCandidate:
         return await self.defer(user_id, candidate_id)
@@ -1105,6 +1180,32 @@ class ConferenceResearchService:
             canonical_url(candidate.source_url) or candidate.source_url,
             candidate.normalized_title,
         )
+
+    @staticmethod
+    def _research_signature(
+        research: VerifiedConferenceResearch | None,
+    ) -> tuple[tuple[str, str], ...]:
+        if research is None:
+            return ()
+        values: list[tuple[str, str]] = [
+            (item.kind, item.value)
+            for item in research.facts
+            if item.kind in {
+                "start_date",
+                "end_date",
+                "program",
+            }
+        ]
+        values.extend(
+            (
+                f"deadline:{item.deadline_type.value}",
+                item.exact_date.isoformat()
+                if item.exact_date is not None
+                else f"{item.approximate_year}-{item.approximate_month or 0:02d}",
+            )
+            for item in research.deadlines
+        )
+        return tuple(sorted(values))
 
     @staticmethod
     def _candidate_verification_status(

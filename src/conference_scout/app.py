@@ -21,6 +21,7 @@ from conference_scout.ai.service import AIService
 from conference_scout.ai.usage import OllamaUsageService
 from conference_scout.bot.dependencies import RepositoryMiddleware
 from conference_scout.bot.router import build_router
+from conference_scout.conferences.cycle import ConferenceCycleService
 from conference_scout.conferences.deduplication import normalize_name
 from conference_scout.conferences.discovery import DiscoveryService
 from conference_scout.conferences.evidence import EvidenceDocument, EvidenceValidator
@@ -139,6 +140,49 @@ def _research_ai_service(registry: ModelRegistry, user_id: int) -> AIService:
     return AIService(
         ActiveLLMProvider(registry, user_id, ModelRole.RESEARCH),
         verifier_provider=ActiveLLMProvider(registry, user_id, ModelRole.VERIFIER),
+    )
+
+
+def _conference_cycle_service(
+    session: AsyncSession,
+    user_id: int,
+    settings: Settings,
+    registry: ModelRegistry,
+    search,
+    fetcher,
+    application_clock: ApplicationClock,
+) -> ConferenceCycleService:
+    ai = _research_ai_service(registry, user_id)
+    cache = WebDocumentCacheRepository(session)
+    research = ConferenceResearchService(
+        session,
+        search,
+        fetcher,
+        ai,
+        max_page_bytes=settings.max_page_bytes,
+        max_page_chars=settings.max_page_text_chars,
+        application_clock=application_clock,
+        min_relevance_score=settings.min_relevance_score,
+        cache=cache,
+    )
+    monitoring = MonitoringService(
+        session,
+        fetcher,
+        ai,
+        settings.max_page_bytes,
+        settings.max_page_text_chars,
+        search,
+        cache=cache,
+        recipes=ParserRecipeRepository(session),
+        reader=_reader_fallback(settings, fetcher),
+        monitoring_interval_hours=settings.monitoring_interval_hours,
+    )
+    return ConferenceCycleService(
+        AgentWorkflowRepository(session),
+        monitoring,
+        research,
+        application_clock=application_clock,
+        topics=TopicRepository(session),
     )
 
 
@@ -423,6 +467,28 @@ async def _run_bot(
                 application_clock,
             )
             workflow_planner = WorkflowPlanner()
+        conference_research = ConferenceResearchService(
+            session,
+            search,
+            fetcher,
+            research_ai_service,
+            max_page_bytes=settings.max_page_bytes,
+            max_page_chars=settings.max_page_text_chars,
+            application_clock=application_clock,
+            min_relevance_score=settings.min_relevance_score,
+        )
+        monitoring = MonitoringService(
+            session,
+            fetcher,
+            research_ai_service,
+            settings.max_page_bytes,
+            settings.max_page_text_chars,
+            search,
+            cache=WebDocumentCacheRepository(session),
+            recipes=ParserRecipeRepository(session),
+            reader=_reader_fallback(settings, fetcher),
+            monitoring_interval_hours=settings.monitoring_interval_hours,
+        )
         return {
             "model_registry": registry,
             "application_clock": application_clock,
@@ -443,27 +509,14 @@ async def _run_bot(
                 application_clock=application_clock,
             ),
             "ai_service": ai_service,
-            "conference_research_service": ConferenceResearchService(
-                session,
-                search,
-                fetcher,
-                research_ai_service,
-                max_page_bytes=settings.max_page_bytes,
-                max_page_chars=settings.max_page_text_chars,
+            "conference_research_service": conference_research,
+            "monitoring_service": monitoring,
+            "conference_cycle_service": ConferenceCycleService(
+                AgentWorkflowRepository(session),
+                monitoring,
+                conference_research,
                 application_clock=application_clock,
-                min_relevance_score=settings.min_relevance_score,
-            ),
-            "monitoring_service": MonitoringService(
-                session,
-                fetcher,
-                research_ai_service,
-                settings.max_page_bytes,
-                settings.max_page_text_chars,
-                search,
-                cache=WebDocumentCacheRepository(session),
-                recipes=ParserRecipeRepository(session),
-                reader=_reader_fallback(settings, fetcher),
-                monitoring_interval_hours=settings.monitoring_interval_hours,
+                topics=TopicRepository(session),
             ),
         }
 

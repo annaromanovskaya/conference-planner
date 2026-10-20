@@ -43,6 +43,7 @@ from conference_scout.schemas.common import (
     ProviderUsageStatus,
     SourceType,
     VerificationStatus,
+    WorkflowKind,
 )
 from conference_scout.schemas.parser_recipes import PageKind, RecipeStatus
 
@@ -508,6 +509,9 @@ class AgentRun(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     request_text: Mapped[str] = mapped_column(Text)
+    workflow_kind: Mapped[WorkflowKind] = mapped_column(
+        Enum(WorkflowKind), default=WorkflowKind.CONFERENCE_RESEARCH, index=True
+    )
     status: Mapped[AgentRunStatus] = mapped_column(Enum(AgentRunStatus), index=True)
     plan: Mapped[dict[str, Any]] = mapped_column(JSON)
     budget: Mapped[dict[str, Any]] = mapped_column(JSON)
