@@ -13,7 +13,7 @@ def valid_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_settings_parse_reminder_days(valid_environment: None) -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.reminder_days == (30, 14, 7, 3, 1)
+    assert settings.reminder_days == (30, 14, 7, 3, 1, 0)
     assert settings.reminder_hour == 9
 
 

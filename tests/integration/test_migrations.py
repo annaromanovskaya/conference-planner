@@ -348,6 +348,48 @@ def test_candidate_snapshot_migration_preserves_existing_candidate(tmp_path: Pat
     } <= columns
 
 
+def test_daily_reminder_migration_preserves_old_delivery_keys(tmp_path: Path) -> None:
+    database = tmp_path / "daily-reminders.db"
+    engine = create_engine(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO alembic_version (version_num) VALUES ('20261020_0012')"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE reminders ("
+            "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, deadline_id INTEGER NOT NULL, "
+            "days_before INTEGER NOT NULL, sent_at DATETIME NOT NULL, "
+            "created_at DATETIME NOT NULL, "
+            "UNIQUE (user_id, deadline_id, days_before))"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO reminders VALUES "
+            "(1, 7, 9, 14, '2026-10-20 09:00:00', '2026-10-20 09:00:00')"
+        )
+    engine.dispose()
+
+    command.upgrade(_alembic_config(database), "head")
+
+    migrated = create_engine(f"sqlite:///{database}")
+    columns = {item["name"] for item in inspect(migrated).get_columns("reminders")}
+    with migrated.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT notification_kind, threshold, sent_at "
+                "FROM reminders WHERE id = 1"
+            )
+        ).one()
+    migrated.dispose()
+
+    assert {"notification_kind", "threshold"} <= columns
+    assert row.notification_kind == "EXACT"
+    assert row.threshold == 14
+    assert str(row.sent_at).startswith("2026-10-20 09:00:00")
+
+
 def test_candidate_decision_migration_marks_legacy_skipped_without_reactivating(
     tmp_path: Path,
 ) -> None:

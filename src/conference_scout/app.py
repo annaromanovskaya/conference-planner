@@ -19,8 +19,8 @@ from conference_scout.ai.active_provider import ActiveLLMProvider
 from conference_scout.ai.registry import ModelRegistry, ProviderProfile, build_provider_profiles
 from conference_scout.ai.service import AIService
 from conference_scout.ai.usage import OllamaUsageService
-from conference_scout.bot.dependencies import RepositoryMiddleware
 from conference_scout.bot.agent_router import format_cycle_report
+from conference_scout.bot.dependencies import RepositoryMiddleware
 from conference_scout.bot.router import build_router
 from conference_scout.conferences.cycle import (
     ConferenceCycleReport,
@@ -65,7 +65,7 @@ from conference_scout.mcp.lifecycle import MCPServerLifecycle
 from conference_scout.mcp.server import build_mcp_app, build_mcp_server
 from conference_scout.mcp.tools import MCPToolServices
 from conference_scout.owner import OwnerContext, bootstrap_owner
-from conference_scout.reminders.service import ReminderCandidate, ReminderService
+from conference_scout.reminders.service import ReminderNotice, ReminderService
 from conference_scout.runtime_clock import ApplicationClock
 from conference_scout.scheduler.setup import configure_scheduler
 from conference_scout.schemas.agent import (
@@ -560,14 +560,10 @@ async def _run_bot(
         async with session_factory() as session:
             repository = ReminderRepository(session)
 
-            async def send(candidate: ReminderCandidate, days: int) -> None:
-                await bot.send_message(
-                    owner.telegram_id,
-                    f"⏰ Через {days} дней: {candidate.conference_name}\n"
-                    f"{candidate.deadline_type}: {candidate.deadline_date.isoformat()}",
-                )
+            async def send(notice: ReminderNotice) -> None:
+                await bot.send_message(owner.telegram_id, notice.telegram_text())
 
-            await ReminderService(repository, settings.reminder_days).process(
+            await ReminderService(repository, settings.reminder_days).process_daily(
                 owner.user_id, application_clock.today(), send
             )
 

@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     reminder_hour: int = Field(default=9, ge=0, le=23)
     monitoring_hour: int = Field(default=9, ge=0, le=23)
     monitoring_interval_hours: int = Field(default=72, ge=24, le=720)
-    reminder_days: Annotated[tuple[int, ...], NoDecode] = (30, 14, 7, 3, 1)
+    reminder_days: Annotated[tuple[int, ...], NoDecode] = (30, 14, 7, 3, 1, 0)
     min_relevance_score: float = Field(default=0.5, ge=0, le=1)
     app_timezone: str = "UTC"
     log_level: str = "INFO"
@@ -117,8 +117,8 @@ class Settings(BaseSettings):
     @field_validator("reminder_days")
     @classmethod
     def validate_reminder_days(cls, value: tuple[int, ...]) -> tuple[int, ...]:
-        if not value or any(day <= 0 for day in value):
-            raise ValueError("reminder days must be positive")
+        if not value or any(day < 0 for day in value):
+            raise ValueError("reminder days must be non-negative")
         if len(set(value)) != len(value):
             raise ValueError("reminder days must be unique")
         return tuple(sorted(value, reverse=True))

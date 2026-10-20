@@ -33,6 +33,48 @@ async def test_user_repository_does_not_create_duplicate(session: AsyncSession) 
 
 
 @pytest.mark.asyncio
+async def test_conference_match_recognizes_child_page_of_event_site(
+    session: AsyncSession,
+) -> None:
+    conference = Conference(
+        name="IMBASE 2027",
+        normalized_name="imbase 2027",
+        website="https://meetings.iac.es/imbase2027/",
+        source_url="https://meetings.iac.es/imbase2027/",
+    )
+    session.add(conference)
+    await session.flush()
+
+    matched = await ConferenceRepository(session).find_match(
+        "The Impact of Binaries on Stellar Evolution",
+        {"https://meetings.iac.es/imbase2027/pages/important-dates.php"},
+    )
+
+    assert matched is not None
+    assert matched.id == conference.id
+
+
+@pytest.mark.asyncio
+async def test_conference_match_does_not_treat_domain_root_as_event_scope(
+    session: AsyncSession,
+) -> None:
+    conference = Conference(
+        name="First IAU Conference",
+        normalized_name="first iau conference",
+        website="https://www.iau.org/",
+    )
+    session.add(conference)
+    await session.flush()
+
+    matched = await ConferenceRepository(session).find_match(
+        "Second IAU Conference",
+        {"https://www.iau.org/science/meetings/second"},
+    )
+
+    assert matched is None
+
+
+@pytest.mark.asyncio
 async def test_deadline_change_updates_value_and_creates_history(session: AsyncSession) -> None:
     conference = Conference(
         name="Astroinformatics 2027",
@@ -106,11 +148,11 @@ async def test_reminder_uniqueness_is_database_enforced(session: AsyncSession) -
     session.add(deadline)
     await session.flush()
     repository = ReminderRepository(session)
-    await repository.record_sent(owner.id, deadline.id, 14, datetime.now(UTC))
+    await repository.record_notice(owner.id, deadline.id, "EXACT", 14, datetime.now(UTC))
     await session.commit()
 
     with pytest.raises(IntegrityError):
-        await repository.record_sent(owner.id, deadline.id, 14, datetime.now(UTC))
+        await repository.record_notice(owner.id, deadline.id, "EXACT", 14, datetime.now(UTC))
 
 
 @pytest.mark.asyncio
@@ -141,6 +183,66 @@ async def test_reminder_candidates_only_include_owner_tracking(session: AsyncSes
     subscription.status = ConferenceStatus.ARCHIVED
     await session.commit()
     assert await ReminderRepository(session).candidates(owner.id) == []
+
+
+@pytest.mark.asyncio
+async def test_deadline_projection_and_reminders_include_exact_and_approximate(
+    session: AsyncSession,
+) -> None:
+    owner = await UserRepository(session).get_or_create_by_telegram_id(999)
+    conference = Conference(name="IMBASE", normalized_name="imbase")
+    session.add(conference)
+    await session.flush()
+    session.add(Subscription(user_id=owner.id, conference_id=conference.id))
+    session.add_all(
+        [
+            Deadline(
+                conference_id=conference.id,
+                deadline_type=DeadlineType.REGISTRATION,
+                approximate_year=2027,
+                approximate_month=5,
+                tentative=True,
+                source_url="https://example.org/dates",
+            ),
+            Deadline(
+                conference_id=conference.id,
+                deadline_type=DeadlineType.ABSTRACT_SUBMISSION,
+                deadline_date=date(2027, 2, 12),
+                source_url="https://example.org/dates",
+            ),
+            Deadline(
+                conference_id=conference.id,
+                deadline_type=DeadlineType.PAYMENT,
+                approximate_year=2025,
+                approximate_month=1,
+                source_url="https://example.org/old",
+            ),
+            Deadline(
+                conference_id=conference.id,
+                deadline_type=DeadlineType.OTHER,
+                approximate_year=2026,
+                approximate_month=9,
+                source_url="https://example.org/past-month",
+            ),
+        ]
+    )
+    await session.commit()
+    repository = ReminderRepository(session)
+
+    upcoming = await repository.upcoming(owner.id, date(2026, 10, 14))
+    reminders = await repository.candidates(owner.id)
+
+    assert [item.deadline_type for item in upcoming] == [
+        "ABSTRACT_SUBMISSION",
+        "REGISTRATION",
+    ]
+    assert [item.deadline_type for item in reminders] == [
+        "REGISTRATION",
+        "ABSTRACT_SUBMISSION",
+        "PAYMENT",
+        "OTHER",
+    ]
+    assert reminders[0].approximate_month == 5
 
 
 @pytest.mark.asyncio

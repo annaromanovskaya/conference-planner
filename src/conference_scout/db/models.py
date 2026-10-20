@@ -190,12 +190,22 @@ class Subscription(Base):
 
 class Reminder(Base):
     __tablename__ = "reminders"
-    __table_args__ = (UniqueConstraint("user_id", "deadline_id", "days_before"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "deadline_id",
+            "notification_kind",
+            "threshold",
+            name="uq_reminders_delivery_key",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     deadline_id: Mapped[int] = mapped_column(ForeignKey("deadlines.id", ondelete="CASCADE"))
     days_before: Mapped[int]
+    notification_kind: Mapped[str] = mapped_column(String(32), default="EXACT")
+    threshold: Mapped[int] = mapped_column(default=0)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
 
