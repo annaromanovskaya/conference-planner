@@ -453,6 +453,156 @@ async def test_search_can_continue_past_twenty_sites_across_pages(
 
 
 @pytest.mark.asyncio
+async def test_fresh_search_continues_after_fully_known_first_page(
+    session: AsyncSession,
+) -> None:
+    class Search:
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        async def search(self, _query: str, *, page: int = 1):
+            self.pages.append(page)
+            if page == 1:
+                return [
+                    SearchResult(
+                        title="Known stellar meeting",
+                        url="https://events.example/known",
+                    )
+                ]
+            if page == 2:
+                return [
+                    SearchResult(
+                        title="New binary stars meeting",
+                        url="https://events.example/new",
+                    )
+                ]
+            return []
+
+    owner = await UserRepository(session).get_or_create_by_telegram_id(5_030)
+    search = Search()
+    service = _service(session, search=search)
+    await service.search(owner.id, "stellar astronomy", limit=10, page=1)
+    search.pages.clear()
+
+    report = await service.search_fresh(
+        owner.id,
+        "stellar astronomy",
+        page_limit=3,
+        results_per_page=10,
+    )
+
+    assert search.pages == [1, 2]
+    assert report.pages_checked == 2
+    assert len(report.new_ids) == 1
+    assert report.new_ids[0] in report.active_ids
+    assert report.duplicates == 1
+    assert report.exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_fresh_search_never_reactivates_rejected_candidate(
+    session: AsyncSession,
+) -> None:
+    class Search:
+        async def search(self, _query: str, *, page: int = 1):
+            if page == 1:
+                return [
+                    SearchResult(
+                        title="Rejected meeting",
+                        url="https://events.example/rejected",
+                    )
+                ]
+            if page == 2:
+                return [
+                    SearchResult(
+                        title="Fresh meeting",
+                        url="https://events.example/fresh",
+                    )
+                ]
+            return []
+
+    owner = await UserRepository(session).get_or_create_by_telegram_id(5_031)
+    service = _service(session, search=Search())
+    rejected = (await service.search(owner.id, "stars", limit=10, page=1))[0]
+    await service.reject(owner.id, rejected.id)
+
+    report = await service.search_fresh(
+        owner.id,
+        "stars",
+        page_limit=3,
+        results_per_page=10,
+    )
+
+    await session.refresh(rejected)
+    assert rejected.status == CandidateStatus.REJECTED
+    assert rejected.id not in report.active_ids
+    assert len(report.new_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_search_with_no_new_candidates_is_successful(
+    session: AsyncSession,
+) -> None:
+    class Search:
+        async def search(self, _query: str, *, page: int = 1):
+            if page == 1:
+                return [
+                    SearchResult(
+                        title="Known meeting",
+                        url="https://events.example/known-only",
+                    )
+                ]
+            return []
+
+    owner = await UserRepository(session).get_or_create_by_telegram_id(5_032)
+    service = _service(session, search=Search())
+    await service.search(owner.id, "stars", limit=10, page=1)
+
+    report = await service.search_fresh(
+        owner.id,
+        "stars",
+        page_limit=3,
+        results_per_page=10,
+    )
+
+    assert report.new_ids == ()
+    assert report.pages_checked == 2
+    assert report.duplicates == 1
+    assert report.exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_two_events_from_one_catalog_url_are_distinct_candidates(
+    session: AsyncSession,
+) -> None:
+    catalog_url = "https://society.example/future-meetings"
+
+    class Search:
+        async def search(self, _query: str, *, page: int = 1):
+            return [
+                SearchResult(title="IAU Symposium 421", url=catalog_url),
+                SearchResult(title="IAU Symposium 422", url=catalog_url),
+            ]
+
+    owner = await UserRepository(session).get_or_create_by_telegram_id(5_033)
+    service = _service(session, search=Search())
+
+    report = await service.search_fresh(
+        owner.id,
+        "IAU symposia",
+        page_limit=1,
+        results_per_page=10,
+    )
+
+    candidates = await service.repository.list_candidates(owner.id)
+    assert len(report.new_ids) == 2
+    assert [item.title for item in candidates] == [
+        "IAU Symposium 421",
+        "IAU Symposium 422",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_inspect_does_not_track_but_add_returns_tracked_receipt(
     session: AsyncSession,
 ) -> None:

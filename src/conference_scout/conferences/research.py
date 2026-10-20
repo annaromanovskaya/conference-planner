@@ -76,6 +76,15 @@ class CatalogExpansion:
     created_candidate_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateSearchReport:
+    active_ids: tuple[int, ...]
+    new_ids: tuple[int, ...]
+    pages_checked: int
+    duplicates: int
+    exhausted: bool
+
+
 class Fetcher(Protocol):
     async def fetch(self, url: str, *, max_bytes: int) -> FetchedPage: ...
 
@@ -127,6 +136,9 @@ class ConferenceResearchService:
         self.min_relevance_score = min_relevance_score
         self.repository = ConferenceResearchRepository(session)
         self.last_search_new_count = 0
+        self.last_search_new_ids: tuple[int, ...] = ()
+        self.last_search_result_count = 0
+        self.last_search_duplicate_count = 0
 
     async def search(
         self, user_id: int, query: str, limit: int = 10, *, page: int = 1
@@ -140,19 +152,21 @@ class ConferenceResearchService:
                 "Искать только ещё не завершившиеся научные мероприятия."
             )
         raw_results = (await self.search_provider.search(search_query, page=page))[:bounded_limit]
+        self.last_search_result_count = len(raw_results)
         drafts: list[CandidateDraft] = []
-        seen_urls: set[str] = set()
+        seen_identities: set[tuple[str, str]] = set()
         for position, result in enumerate(raw_results):
             url = str(result.url)
             normalized_url = canonical_url(url) or url
-            if normalized_url in seen_urls:
+            identity = (normalized_url, normalize_name(result.title))
+            if identity in seen_identities:
                 continue
             keyword_relevance = evaluate_keyword_relevance(
                 result.title, result.snippet, topics
             )
             if keyword_relevance.explicitly_irrelevant:
                 continue
-            seen_urls.add(normalized_url)
+            seen_identities.add(identity)
             drafts.append(
                 CandidateDraft(
                     title=result.title,
@@ -177,18 +191,75 @@ class ConferenceResearchService:
                 )
             ).tuples()
         )
-        self.last_search_new_count = sum(
-            1
+        new_draft_identities = {
+            self._candidate_identity(item)
             for item in drafts
             if not self._candidate_identity_exists(item, existing_identities)
-        )
+        }
         stored = await self.repository.create_candidates(
             user_id,
             drafts,
             expires_at=datetime.now(UTC) + self.candidate_ttl,
         )
         await self.session.commit()
+        self.last_search_new_ids = tuple(
+            item.id
+            for item in stored
+            if item.status == CandidateStatus.ACTIVE
+            and self._stored_candidate_identity(item) in new_draft_identities
+        )
+        self.last_search_new_count = len(self.last_search_new_ids)
+        self.last_search_duplicate_count = max(
+            0,
+            len(drafts) - self.last_search_new_count,
+        )
         return [item for item in stored if item.status == CandidateStatus.ACTIVE]
+
+    async def search_fresh(
+        self,
+        user_id: int,
+        query: str,
+        *,
+        page_limit: int,
+        results_per_page: int,
+    ) -> CandidateSearchReport:
+        bounded_pages = max(1, min(page_limit, 100))
+        bounded_results = max(1, min(results_per_page, self.MAX_PAGE_RESULTS))
+        active_ids: list[int] = []
+        new_ids: list[int] = []
+        duplicates = 0
+        exhausted = False
+        pages_checked = 0
+
+        for page in range(1, bounded_pages + 1):
+            candidates = await self.search(
+                user_id,
+                query,
+                limit=bounded_results,
+                page=page,
+            )
+            pages_checked += 1
+            for candidate in candidates:
+                if candidate.id not in active_ids:
+                    active_ids.append(candidate.id)
+            for candidate_id in self.last_search_new_ids:
+                if candidate_id not in new_ids:
+                    new_ids.append(candidate_id)
+            duplicates += self.last_search_duplicate_count
+
+            if new_ids:
+                break
+            if self.last_search_result_count == 0:
+                exhausted = True
+                break
+
+        return CandidateSearchReport(
+            active_ids=tuple(active_ids),
+            new_ids=tuple(new_ids),
+            pages_checked=pages_checked,
+            duplicates=duplicates,
+            exhausted=exhausted,
+        )
 
     async def inspect(
         self, user_id: int, candidate_id: int
@@ -1010,15 +1081,29 @@ class ConferenceResearchService:
         draft: CandidateDraft,
         identities: list[tuple[str, str]],
     ) -> bool:
-        normalized_title = normalize_name(draft.title)
+        source_identity, normalized_title = ConferenceResearchService._candidate_identity(draft)
         return any(
-            source_url == draft.source_url
+            (canonical_url(source_url) or source_url) == source_identity
             and (
                 stored_title == normalized_title
                 or stored_title in normalized_title
                 or normalized_title in stored_title
             )
             for source_url, stored_title in identities
+        )
+
+    @staticmethod
+    def _candidate_identity(draft: CandidateDraft) -> tuple[str, str]:
+        return (
+            canonical_url(draft.source_url) or draft.source_url,
+            normalize_name(draft.title),
+        )
+
+    @staticmethod
+    def _stored_candidate_identity(candidate: EventCandidate) -> tuple[str, str]:
+        return (
+            canonical_url(candidate.source_url) or candidate.source_url,
+            candidate.normalized_title,
         )
 
     @staticmethod
