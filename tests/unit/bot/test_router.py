@@ -121,7 +121,11 @@ async def test_topics_renders_ampersand_through_html() -> None:
             return [SimpleNamespace(name="Astro-ML & Stellar Physics")]
 
     router = build_router(owner_telegram_id=123)
-    handler = next(item.callback for item in router.message.handlers if item.callback.__name__ == "topics")
+    handler = next(
+        item.callback
+        for item in router.message.handlers
+        if item.callback.__name__ == "topics"
+    )
     message = Message()
 
     await handler(message, State(), TopicRepository())

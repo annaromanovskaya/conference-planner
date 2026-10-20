@@ -6,7 +6,7 @@
 
 # 1. Назначение
 
-Conference Scout — персональный AI-assisted бот, который:
+Conference Planner — персональный AI-assisted бот, который:
 
 1. Позволяет пользователю задавать интересующие научные тематики.
 2. Преобразует тематики в набор релевантных поисковых ключевых слов.
@@ -855,7 +855,7 @@ Astroinformatics 2027
 
 ## Weekly discovery
 
-Раз в неделю:
+Каждый понедельник в `DISCOVERY_HOUR`:
 
 ```text
 topics
@@ -879,11 +879,11 @@ DB
 Telegram summary
 ```
 
-День/время сделать configurable.
+Час запуска configurable. День фиксирован: понедельник.
 
 ## Conference monitoring
 
-Примерно раз в сутки.
+В составе единого понедельничного цикла и при ручном запуске.
 
 Только для `TRACKING`.
 
@@ -896,7 +896,7 @@ Telegram summary
 
 ## Reminder processing
 
-Например раз в час.
+Один раз в сутки в `REMINDER_HOUR`.
 
 LLM не используется.
 
@@ -910,6 +910,7 @@ LLM не используется.
 7 дней
 3 дня
 1 день
+0 дней
 ```
 
 Сделать эти значения configurable.
@@ -1111,12 +1112,10 @@ DATABASE_URL=sqlite+aiosqlite:////data/conference_scout.db
 
 SEARXNG_URL=http://searxng:8080
 
-DISCOVERY_DAY=sun
 DISCOVERY_HOUR=10
 
-MONITORING_HOUR=9
-
-REMINDER_DAYS=30,14,7,3,1
+REMINDER_HOUR=9
+REMINDER_DAYS=30,14,7,3,1,0
 
 MIN_RELEVANCE_SCORE=0.5
 

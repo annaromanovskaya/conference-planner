@@ -12,10 +12,8 @@ from conference_scout.ai.registry import ProviderProfile
 from conference_scout.ai.service import AIService
 from conference_scout.app import _model_registry, _run_scheduled_conference_cycle
 from conference_scout.conferences.cycle import ConferenceCycleReport, CycleMode
-from conference_scout.conferences.discovery import DiscoveryReport, DiscoveryService
+from conference_scout.conferences.discovery import DiscoveryService
 from conference_scout.db.models import (
-    AgentArtifact,
-    AgentRun,
     Conference,
     Deadline,
     Topic,

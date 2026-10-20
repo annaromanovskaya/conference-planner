@@ -22,6 +22,7 @@ from conference_scout.ai.usage import OllamaUsageService
 from conference_scout.bot.agent_router import format_cycle_report
 from conference_scout.bot.dependencies import RepositoryMiddleware
 from conference_scout.bot.router import build_router
+from conference_scout.bot.usage_router import CycleScheduleService
 from conference_scout.conferences.cycle import (
     ConferenceCycleReport,
     ConferenceCycleService,
@@ -508,6 +509,11 @@ async def _run_bot(
         return {
             "model_registry": registry,
             "application_clock": application_clock,
+            "conference_schedule_service": CycleScheduleService(
+                AgentWorkflowRepository(session),
+                application_clock,
+                settings.discovery_hour,
+            ),
             "ollama_usage_service": OllamaUsageService(OllamaUsageRepository(session), registry),
             "memory_service": memory,
             "confirmation_service": confirmation,

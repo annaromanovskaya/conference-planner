@@ -69,6 +69,19 @@ class AgentWorkflowRepository:
             .limit(1)
         )
 
+    async def latest_run(
+        self, user_id: int, workflow_kind: WorkflowKind
+    ) -> AgentRun | None:
+        return await self.session.scalar(
+            select(AgentRun)
+            .where(
+                AgentRun.user_id == user_id,
+                AgentRun.workflow_kind == workflow_kind,
+            )
+            .order_by(AgentRun.id.desc())
+            .limit(1)
+        )
+
     async def get_run(self, user_id: int, run_id: int) -> AgentRun:
         run = await self.session.scalar(
             select(AgentRun).where(AgentRun.id == run_id, AgentRun.user_id == user_id)
