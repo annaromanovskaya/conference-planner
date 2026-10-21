@@ -1,0 +1,25 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite*
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.worktrees/
+
+# Локальные настройки и служебные файлы AI-инструментов
+.codex/
+.agents/
+.superpowers/
+docs/superpowers/
+TASK.md
+PROGRESS.md
+
+# Тесты не публикуются в рабочем репозитории приложения
+tests/

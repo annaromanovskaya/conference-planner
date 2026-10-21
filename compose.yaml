@@ -1,0 +1,29 @@
+services:
+  confplanner:
+    container_name: confplanner
+    image: confplanner:latest
+    build: .
+    env_file: [.env]
+    depends_on:
+      searxng:
+        condition: service_started
+    volumes:
+      - conference_data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  searxng:
+    image: searxng/searxng:latest
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    read_only: true
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+volumes:
+  conference_data:
