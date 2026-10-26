@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, Message
 
 from conference_planner.ai.registry import ModelRegistry
 from conference_planner.ai.usage import OllamaUsageService, OllamaUsageSnapshot
+from conference_planner.bot.command_catalog import command_help_text
 from conference_planner.bot.keyboards import ollama_usage_keyboard
 from conference_planner.bot.model_router import list_model_profiles
 from conference_planner.db.repositories.agent_workflows import AgentWorkflowRepository
@@ -164,7 +165,15 @@ def format_usage_snapshot(
             "Следующий цикл: понедельник, "
             f"{cycle_schedule.next_run_at:%Y-%m-%d %H:%M}"
         )
-    lines.extend(["", "<b>OLLAMA FREE USAGE</b>", f"Статус: {STATUS_LABELS[snapshot.status]}"])
+    lines.extend(
+        [
+            "",
+            command_help_text(),
+            "",
+            "<b>OLLAMA FREE USAGE</b>",
+            f"Статус: {STATUS_LABELS[snapshot.status]}",
+        ]
+    )
     if snapshot.status_observed_at is not None:
         observed = snapshot.status_observed_at.astimezone(UTC)
         lines.append(f"Последнее наблюдение: {observed:%Y-%m-%d %H:%M} UTC")

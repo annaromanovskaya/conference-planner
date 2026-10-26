@@ -12,6 +12,7 @@ from aiogram.types import Message
 
 from conference_planner.agent.capabilities import capability_help_text, is_capability_question
 from conference_planner.agent.runtime import AgentReply, AgentRuntime
+from conference_planner.bot.command_catalog import UNKNOWN_COMMAND_TEXT
 from conference_planner.bot.keyboards import action_confirmation, main_menu
 from conference_planner.conferences.cycle import (
     ConferenceCycleReport,
@@ -139,6 +140,10 @@ def build_agent_router() -> Router:
         await state.clear()
         await handle_help(message)
 
+    @router.message(F.text.startswith("/"))
+    async def unknown_command(message: Message, state: FSMContext) -> None:
+        await handle_unknown_command(message, state)
+
     @router.message(F.text)
     async def free_text(
         message: Message,
@@ -162,6 +167,11 @@ def build_agent_router() -> Router:
         )
 
     return router
+
+
+async def handle_unknown_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(UNKNOWN_COMMAND_TEXT, reply_markup=main_menu())
 
 
 async def handle_free_text(

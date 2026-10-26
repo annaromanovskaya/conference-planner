@@ -1,3 +1,5 @@
+from conference_planner.bot.command_catalog import command_help_text
+
 _CAPABILITY_HELP = "\n".join(
     (
         "Я — агент-планировщик научных конференций.",
@@ -24,18 +26,12 @@ _CAPABILITY_HELP = "\n".join(
         "Показываю ближайшие дедлайны. Проверка напоминаний выполняется раз в сутки; "
         "уведомления отправляются только при достижении заданного порога, а не каждый час.",
         "",
-        "6. Команды",
-        "/model — выбрать модель",
-        "/new — начать новый диалог без удаления долгосрочной памяти",
-        "/memory — показать память",
-        "/forget ID — предложить удалить запись памяти",
-        "/help — показать этот список возможностей",
     )
 )
 
 
 def capability_help_text() -> str:
-    return _CAPABILITY_HELP
+    return f"{_CAPABILITY_HELP}\n\n{command_help_text(title='6. Команды')}"
 
 
 def is_capability_question(text: str) -> bool:
