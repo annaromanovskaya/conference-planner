@@ -13,3 +13,13 @@ dist/
 *.egg-info/
 .worktrees/
 
+# Локальные настройки и служебные файлы AI-инструментов
+.codex/
+.agents/
+.superpowers/
+docs/superpowers/
+TASK.md
+PROGRESS.md
+
+# Тесты не публикуются в рабочем репозитории приложения
+tests/

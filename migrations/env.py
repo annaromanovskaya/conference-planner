@@ -3,8 +3,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from conference_scout.db import models as _models  # noqa: F401
-from conference_scout.db.base import Base
+from conference_planner.db import models as _models  # noqa: F401
+from conference_planner.db.base import Base
 
 config = context.config
 if config.config_file_name is not None:

@@ -10,8 +10,8 @@ from collections.abc import Sequence
 from alembic import op
 from sqlalchemy import inspect
 
-from conference_scout.db import models as _models  # noqa: F401
-from conference_scout.db.base import Base
+from conference_planner.db import models as _models  # noqa: F401
+from conference_planner.db.base import Base
 
 revision: str = "20261013_0001"
 down_revision: str | None = None

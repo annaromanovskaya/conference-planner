@@ -1,12 +1,12 @@
 services:
-  conference-scout:
+  confplanner:
+    container_name: confplanner
+    image: confplanner:latest
     build: .
     env_file: [.env]
     depends_on:
       searxng:
         condition: service_started
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - conference_data:/data
     read_only: true

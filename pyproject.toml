@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "conference-scout"
+name = "conference-planner"
 version = "0.1.0"
 description = "Personal self-hosted Telegram bot for scientific conference deadline tracking"
 readme = "README.md"
@@ -21,7 +21,7 @@ dependencies = [
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
   "rapidfuzz>=3.13,<4",
-  "sqlalchemy>=2.0.41,<3",
+  "sqlalchemy[asyncio]>=2.0.41,<3",
   "uvicorn>=0.35,<1",
 ]
 
@@ -34,11 +34,11 @@ dev = [
 ]
 
 [project.scripts]
-conference-scout = "conference_scout.main:run"
-conference-scout-healthcheck = "conference_scout.healthcheck:run"
+conference-planner = "conference_planner.main:run"
+conference-planner-healthcheck = "conference_planner.healthcheck:run"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/conference_scout"]
+packages = ["src/conference_planner"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-markers --import-mode=importlib"
