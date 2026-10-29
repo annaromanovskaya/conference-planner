@@ -322,6 +322,7 @@ class ConferenceResearchService:
                 queue.append((source.url, 0, source.url, source.name))
                 queued.add(canonical_url(source.url) or source.url)
         added_ids: list[int] = []
+        active_ids: list[int] = []
         errors: list[str] = []
         opened = 0
         inspected_candidates: set[str] = set()
@@ -392,8 +393,11 @@ class ConferenceResearchService:
                 stored = await self.repository.create_candidates(
                     user_id, drafts, expires_at=datetime.now(UTC) + self.candidate_ttl,
                 )
+                active_ids.extend(c.id for c in stored
+                                  if c.status == CandidateStatus.ACTIVE and c.id not in active_ids)
                 added_ids.extend(c.id for c in stored
-                                 if c.source_url not in existing and c.id not in added_ids)
+                                 if c.status == CandidateStatus.ACTIVE
+                                 and c.source_url not in existing and c.id not in added_ids)
                 if self.discovery_job_id is not None:
                     self.session.add(DiscoverySearchAudit(
                         job_id=self.discovery_job_id,
@@ -416,7 +420,8 @@ class ConferenceResearchService:
                         urls=[{"url": url, "decision": "SOURCE_UNAVAILABLE", "depth": depth}],
                     ))
                     await self.session.commit()
-        return {"new_ids": tuple(added_ids), "sources_opened": opened,
+        return {"new_ids": tuple(added_ids), "active_ids": tuple(active_ids),
+                "sources_opened": opened,
                 "sources_total": len(sources), "errors": tuple(errors),
                 "pending_catalogs": len(queue)}
 

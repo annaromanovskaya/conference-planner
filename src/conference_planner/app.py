@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -47,6 +48,7 @@ from conference_planner.db.models import (
     ConferenceChange,
     ConferenceEvidence,
     ConferenceTopic,
+    EventCandidate,
     Subscription,
     Topic,
     DiscoveryJob,
@@ -257,7 +259,35 @@ def _durable_conference_workflow(
             logger.warning("SearXNG search failed after trusted source crawl: %s", type(exc).__name__)
         direct_ids = list(trusted_report["new_ids"])
         combined_new_ids = list(dict.fromkeys([*direct_ids, *search_report.new_ids]))
-        combined_active_ids = list(dict.fromkeys([*direct_ids, *search_report.active_ids]))
+        combined_active_ids = list(dict.fromkeys([
+            *trusted_report["active_ids"], *search_report.active_ids,
+        ]))
+        # Revisit candidates already discovered in earlier runs. Only-new
+        # selection caused subsequent searches to inspect zero pages.
+        candidates_for_check = list(await session.scalars(
+            select(EventCandidate).where(
+                EventCandidate.user_id == user_id,
+                EventCandidate.id.in_(combined_active_ids),
+                EventCandidate.status == CandidateStatus.ACTIVE,
+                EventCandidate.researched_at.is_(None),
+            )
+        )) if combined_active_ids else []
+        requested_years = set(re.findall(r"\b20\d{2}\b", query))
+        def priority(item):
+            from urllib.parse import urlsplit
+            text = f"{item.title} {item.source_url}".casefold()
+            url = urlsplit(item.source_url)
+            year_matches = bool(requested_years & set(re.findall(r"20\d{2}", text)))
+            has_other_year = bool(set(re.findall(r"20\d{2}", text)) - requested_years)
+            official = any(domain in (url.hostname or "") for domain in (
+                "iau.org", "eso.org", "aas.org", "indico.cern.ch",
+                "sai.msu.ru", "inasan.ru", "esa.int",
+            ))
+            document = bool(re.search(r"\.(?:pdf|docx?|xlsx?)(?:$|[?#])", item.source_url, re.I))
+            return (document, has_other_year and not year_matches,
+                    not year_matches, not official, -(item.relevance_score or 0), item.id)
+        candidates_for_check.sort(key=priority)
+        inspection_ids = [item.id for item in candidates_for_check[:12]]
         # Research bounded candidate pages now, rather than treating SearXNG
         # snippets as checked conference sites. Record URL-level evidence.
         verified_pages = 0
@@ -267,7 +297,7 @@ def _durable_conference_workflow(
         if discovery_job_id is not None:
             from conference_planner.db.models import DiscoverySearchAudit
             from conference_planner.conferences.research import CatalogExpansion
-            for candidate_id in combined_new_ids[:12]:
+            for candidate_id in inspection_ids:
                 candidate = await research.repository.get_candidate(user_id, candidate_id)
                 url = candidate.source_url
                 try:
@@ -314,14 +344,14 @@ def _durable_conference_workflow(
                      "verified_pages": verified_pages,
                      "verified_candidate_ids": verified_candidate_ids,
                      "model_errors": model_errors,
-                     "pending_verification": max(0, len(combined_new_ids)-12),
+                     "pending_verification": max(0, len(candidates_for_check)-len(inspection_ids)),
                      "trusted_sources_opened": trusted_report["sources_opened"],
                      "verification_errors": verification_errors,
                      "duplicates": search_report.duplicates,
                      "error_code": (search_report.error_code if not trusted_report["sources_opened"] and not combined_new_ids
                                     else "PARTIAL_VERIFICATION" if verification_errors or trusted_report["pending_catalogs"]
-                                    else "VERIFICATION_BUDGET_REACHED" if len(combined_new_ids) > 12
-                                    else "NO_VERIFIED_EVENTS" if not combined_new_ids else None)},
+                                    else "VERIFICATION_BUDGET_REACHED" if len(candidates_for_check) > len(inspection_ids)
+                                    else "NO_VERIFIED_EVENTS" if not verified_candidate_ids else None)},
         )
 
     async def crawl_task(context):
