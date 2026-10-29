@@ -248,6 +248,61 @@ def build_mcp_server(services: MCPToolServices) -> MCPServer:
 
     @server.tool(
         description=(
+            "Retrieve actual SearXNG search requests, URLs, filtering decisions and "
+            "engine failures for an owner-scoped discovery job. Search results are "
+            "not evidence that the sites were fetched or verified. Use when asked "
+            "which pages were checked or why no conferences were found."
+        ), annotations=read_only,
+    )
+    async def get_discovery_search_log(
+        job_id: int | None = None, limit: Limit = 20
+    ) -> Any:
+        return await read("get_discovery_search_log", {"job_id": job_id, "limit": limit})
+
+    @server.tool(
+        description="Inspect one candidate's actual webpage and return verified event evidence or an explicit inaccessible/non-conference result. May update candidate verification state; never infer verification from search snippets.",
+        annotations=automatic_update,
+    )
+    async def verify_conference_page(candidate_id: PositiveId) -> Any:
+        return await read("verify_conference_page", {"candidate_id": candidate_id})
+
+    @server.tool(
+        description="Search enabled organizer/institution source domains for scientific events in a target year, using bounded SearXNG queries. Results still require page verification.",
+        annotations=automatic_update,
+    )
+    async def search_official_sources(topic: str, year: int, limit: Limit = 6) -> Any:
+        return await read("search_official_sources", {"topic": topic, "year": year, "limit": limit})
+
+    @server.tool(
+        description="Inspect a calendar/catalog candidate and extract separate conference candidate records with source provenance.",
+        annotations=automatic_update,
+    )
+    async def expand_conference_catalog(candidate_id: PositiveId) -> Any:
+        return await read("expand_conference_catalog", {"candidate_id": candidate_id})
+
+    @server.tool(
+        description="Read and verify deadline evidence for an already researched candidate. Include URLs and uncertainty; do not assert secondary dates are confirmed.",
+        annotations=read_only,
+    )
+    async def verify_deadlines(candidate_id: PositiveId) -> Any:
+        return await read("verify_deadlines", {"candidate_id": candidate_id})
+
+    @server.tool(
+        description="Look for duplicates among owner-accessible conferences and candidates by official URL, name, acronym and event date; report candidate matches without merging.",
+        annotations=read_only,
+    )
+    async def deduplicate_events(candidate_id: PositiveId, limit: Limit = 50) -> Any:
+        return await read("deduplicate_events", {"candidate_id": candidate_id, "limit": limit})
+
+    @server.tool(
+        description="Suggest diversified bounded scientific-conference search queries when results are empty or engines fail; suggestions are not verified findings.",
+        annotations=read_only,
+    )
+    async def search_strategy_refine(topic: str, year: int, previous_queries: list[str] | None = None) -> Any:
+        return await read("search_strategy_refine", {"topic": topic, "year": year, "previous_queries": (previous_queries or [])})
+
+    @server.tool(
+        description=(
             "List the owner's hidden deferred or rejected conference candidates. "
             "Use only when the owner explicitly asks for one of these lists."
         ),

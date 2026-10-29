@@ -6,6 +6,7 @@ from typing import ClassVar, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from conference_planner.conferences.scheduled_tools import run_scheduled_agent_tools
 from conference_planner.conferences.research import (
     CandidateExpiredError,
     CandidateUnusableError,
@@ -301,7 +302,34 @@ class ConferenceCycleService:
                 for diagnostic in report.unresponsive_engines:
                     if diagnostic not in unresponsive_engines:
                         unresponsive_engines.append(diagnostic)
+            # The scheduled workflow invokes the same verified research tools as
+            # the interactive MCP agent. It is bounded and does not auto-persist.
+            tool_statistics = {}
+            if cycle.request.mode == CycleMode.SCHEDULED:
+                try:
+                    year = self.application_clock.today().year + 1
+                    topic = cycle.queries[0] if cycle.queries else "astronomy"
+                    extra = await run_scheduled_agent_tools(
+                        self.research, cycle.user_id, year, topic,
+                        new_candidate_ids, list(cycle.queries),
+                    )
+                    for item in extra.added_ids:
+                        if item not in new_candidate_ids:
+                            new_candidate_ids.append(item)
+                    search_attempts += extra.attempts
+                    pages_checked += extra.checked_pages
+                    errors.extend(extra.errors)
+                    tool_statistics = {
+                        "sites_verified": extra.checked_pages,
+                        "catalogs_expanded": extra.expanded_catalogs,
+                        "deadlines_reviewed": extra.checked_deadlines,
+                        "potential_duplicates": extra.potential_duplicates,
+                    }
+                except Exception as exc:
+                    await self.repository.session.rollback()
+                    errors.append(f"SCHEDULED_TOOLS:{type(exc).__name__}")
             payload = {
+                **tool_statistics,
                 "new_candidate_ids": new_candidate_ids,
                 "duplicates": duplicates,
                 "pages_checked": pages_checked,

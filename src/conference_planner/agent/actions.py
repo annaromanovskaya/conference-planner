@@ -7,13 +7,14 @@ from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from conference_planner.db.models import PendingAction
+from conference_planner.db.models import EventCandidate, PendingAction
 from conference_planner.db.repositories.pending_actions import PendingActionRepository
 from conference_planner.schemas.agent import (
     ActionPayload,
     ActionResult,
     PendingActionView,
     parse_action_payload,
+    SetCandidateDecisionAction,
 )
 from conference_planner.schemas.common import PendingActionStatus
 
@@ -43,11 +44,28 @@ class ConfirmationService:
 
     async def propose(self, user_id: int, payload: ActionPayload) -> PendingActionView:
         parsed = parse_action_payload(payload.model_dump(mode="json"))
+        summary = parsed.confirmation_summary()
+        if isinstance(parsed, SetCandidateDecisionAction):
+            candidate = await self.session.scalar(
+                select(EventCandidate).where(
+                    EventCandidate.id == parsed.candidate_id,
+                    EventCandidate.user_id == user_id,
+                )
+            )
+            if candidate is not None:
+                # The title and URL are read from the owner-scoped database,
+                # never trusted from the LLM action arguments.
+                title = " ".join(candidate.title.split())[:180]
+                summary = (
+                    f"{summary}\n"
+                    f"Название: {title or 'не указано'}\n"
+                    f"Источник: {candidate.source_url[:350]}"
+                )
         action = await self.repository.create(
             user_id,
             action_type=parsed.action,
             payload=parsed.model_dump(mode="json"),
-            summary=parsed.confirmation_summary(),
+            summary=summary,
             expires_at=self.clock() + self.ttl,
         )
         await self.session.commit()

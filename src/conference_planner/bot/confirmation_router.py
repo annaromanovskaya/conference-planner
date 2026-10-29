@@ -1,3 +1,4 @@
+import re
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
@@ -15,6 +16,7 @@ def build_confirmation_router() -> Router:
         confirmation_service,
         conference_research_repository,
         conference_research_service,
+        discovery_controller,
         owner_user_id: int,
     ) -> None:
         await confirm_action(
@@ -23,6 +25,7 @@ def build_confirmation_router() -> Router:
             owner_user_id=owner_user_id,
             conference_research_repository=conference_research_repository,
             conference_research_service=conference_research_service,
+            discovery_controller=discovery_controller,
         )
 
     @router.callback_query(F.data.startswith("action:cancel:"))
@@ -52,6 +55,7 @@ async def confirm_action(
     owner_user_id: int,
     conference_research_repository=None,
     conference_research_service=None,
+    discovery_controller=None,
 ) -> None:
     action_id = _action_id(callback.data, "confirm")
     if action_id is None:
@@ -64,6 +68,8 @@ async def confirm_action(
         result = await service.confirm(owner_user_id, action_id)
     except ActionUnavailable as exc:
         messages = {
+            "action is already being processed": "Действие уже выполняется.",
+            "action payload is invalid": "Данные действия некорректны.",
             "action already completed": "Это действие уже выполнено.",
             "action expired": "Срок подтверждения истёк.",
             "action cancelled": "Действие уже отменено.",
@@ -87,6 +93,10 @@ async def confirm_action(
         return
     await callback.message.answer(f"✅ {result.message}")
     await callback.answer("Выполнено")
+    if discovery_controller is not None:
+        matched = re.search(r"задание №(\d+)", result.message)
+        if matched:
+            await discovery_controller.attach_message(int(matched.group(1)), callback.message)
     if (
         isinstance(payload, ImportConferenceCandidateAction)
         and conference_research_repository is not None

@@ -22,6 +22,7 @@ from conference_planner.ai.usage import OllamaUsageService
 from conference_planner.bot.agent_router import format_cycle_report
 from conference_planner.bot.dependencies import RepositoryMiddleware
 from conference_planner.bot.router import build_router
+from conference_planner.bot.discovery_progress import DiscoveryProgressController
 from conference_planner.bot.usage_router import CycleScheduleService
 from conference_planner.conferences.cycle import (
     ConferenceCycleReport,
@@ -48,6 +49,7 @@ from conference_planner.db.models import (
     ConferenceTopic,
     Subscription,
     Topic,
+    DiscoveryJob,
 )
 from conference_planner.db.repositories.agent_state import AgentStateRepository
 from conference_planner.db.repositories.agent_workflows import AgentWorkflowRepository
@@ -208,6 +210,8 @@ def _durable_conference_workflow(
     search,
     fetcher,
     application_clock: ApplicationClock,
+    on_discovery_progress=None,
+    discovery_job_id: int | None = None,
 ) -> tuple[WorkflowEngine, WorkflowProgress]:
     registry = _model_registry(session, profiles, settings=settings)
     ai = _research_ai_service(registry, user_id)
@@ -220,6 +224,7 @@ def _durable_conference_workflow(
         max_page_chars=settings.max_page_text_chars,
         application_clock=application_clock,
         min_relevance_score=settings.min_relevance_score,
+        discovery_job_id=discovery_job_id,
     )
     async def search_task(context):
         years = context.task.input_data.get("years")
@@ -227,16 +232,96 @@ def _durable_conference_workflow(
             service = _discovery_service(
                 session, user_id, settings, registry, search, fetcher
             )
-            report = await service.run(user_id, years=years)
+            report = await service.run(user_id, years=years, on_progress=on_discovery_progress)
             return TaskArtifact(
                 artifact_kind="candidate_list",
                 payload={"candidate_ids": list(report.created_ids)},
             )
         query = str(context.task.input_data.get("query", context.run.request_text))
-        values = await research.search(user_id, query, limit=20)
+        # User-configured sources are a first-class discovery channel and are
+        # fetched directly even when every SearXNG engine is unavailable.
+        trusted_report = await research.search_trusted_sources(user_id, query)
+        try:
+            search_report = await research.search_fresh(
+                user_id, query, page_limit=5, results_per_page=20,
+            )
+        except Exception as exc:
+            # A failed external search must not discard results from the
+            # independent configured-source crawler.
+            await session.rollback()
+            from types import SimpleNamespace
+            search_report = SimpleNamespace(
+                active_ids=(), new_ids=(), search_attempts=0,
+                duplicates=0, error_code="SEARCH_UNAVAILABLE",
+            )
+            logger.warning("SearXNG search failed after trusted source crawl: %s", type(exc).__name__)
+        direct_ids = list(trusted_report["new_ids"])
+        combined_new_ids = list(dict.fromkeys([*direct_ids, *search_report.new_ids]))
+        combined_active_ids = list(dict.fromkeys([*direct_ids, *search_report.active_ids]))
+        # Research bounded candidate pages now, rather than treating SearXNG
+        # snippets as checked conference sites. Record URL-level evidence.
+        verified_pages = 0
+        verification_errors = 0
+        verified_candidate_ids = []
+        model_errors = 0
+        if discovery_job_id is not None:
+            from conference_planner.db.models import DiscoverySearchAudit
+            from conference_planner.conferences.research import CatalogExpansion
+            for candidate_id in combined_new_ids[:12]:
+                candidate = await research.repository.get_candidate(user_id, candidate_id)
+                url = candidate.source_url
+                try:
+                    result = await research.inspect(user_id, candidate_id)
+                    checked = not isinstance(result, CatalogExpansion)
+                    status = "RESEARCHED" if checked else "CATALOG_EXPANDED"
+                    verified_pages += 1  # successful URL inspection, including expanded catalogs
+                    if checked:
+                        verified_candidate_ids.append(candidate_id)
+                except Exception as exc:
+                    verification_errors += 1
+                    if type(exc).__name__ == "ModelGatewayError":
+                        model_errors += 1
+                    status = "INSPECTION_FAILED"
+                    diagnostic = type(exc).__name__
+                    # An exception can leave SQLAlchemy in an invalid transaction.
+                    await session.rollback()
+                else:
+                    diagnostic = None
+                session.add(DiscoverySearchAudit(
+                    job_id=discovery_job_id, query="[candidate page]", page=1,
+                    result_count=0, retained_count=0, ignored_count=0,
+                    status=status, diagnostics=[diagnostic] if diagnostic else [],
+                    urls=[{"url": url, "decision": status}],
+                ))
+                await session.commit()
+        if on_discovery_progress is not None:
+            # The progress callback opens an independent session: release any
+            # search transaction before attempting to update its job row.
+            await session.commit()
+            from types import SimpleNamespace
+            await on_discovery_progress(SimpleNamespace(
+                created_ids=combined_new_ids,
+                pages_checked=verified_pages + trusted_report["sources_opened"],
+                search_attempts=search_report.search_attempts,
+                rejected_urls=[],
+                errors=([search_report.error_code] if search_report.error_code and not trusted_report["sources_opened"] else []) + list(trusted_report["errors"]) + ["INSPECTION_FAILED"] * verification_errors,
+            ), query)
         return TaskArtifact(
             artifact_kind="candidate_list",
-            payload={"candidate_ids": [item.id for item in values]},
+            payload={"candidate_ids": combined_active_ids,
+                     "new_ids": combined_new_ids,
+                     "search_attempts": search_report.search_attempts,
+                     "verified_pages": verified_pages,
+                     "verified_candidate_ids": verified_candidate_ids,
+                     "model_errors": model_errors,
+                     "pending_verification": max(0, len(combined_new_ids)-12),
+                     "trusted_sources_opened": trusted_report["sources_opened"],
+                     "verification_errors": verification_errors,
+                     "duplicates": search_report.duplicates,
+                     "error_code": (search_report.error_code if not trusted_report["sources_opened"] and not combined_new_ids
+                                    else "PARTIAL_VERIFICATION" if verification_errors or trusted_report["pending_catalogs"]
+                                    else "VERIFICATION_BUDGET_REACHED" if len(combined_new_ids) > 12
+                                    else "NO_VERIFIED_EVENTS" if not combined_new_ids else None)},
         )
 
     async def crawl_task(context):
@@ -454,6 +539,10 @@ async def _run_bot(
     application_clock: ApplicationClock,
 ) -> None:
     dispatcher = Dispatcher(storage=MemoryStorage())
+    discovery_controller = DiscoveryProgressController(
+        bot, session_factory, owner.user_id, owner.telegram_id,
+        settings, profiles, search, fetcher, application_clock,
+    )
     router = build_router(owner_telegram_id=owner.telegram_id)
 
     def services(session: AsyncSession) -> dict[str, Any]:
@@ -474,6 +563,7 @@ async def _run_bot(
                 search,
                 fetcher,
                 application_clock,
+                enqueue_discovery=discovery_controller.enqueue_callback(session),
             ),
         )
         ai_service = AIService(ActiveLLMProvider(registry, owner.user_id))
@@ -524,6 +614,7 @@ async def _run_bot(
             "ollama_usage_service": OllamaUsageService(OllamaUsageRepository(session), registry),
             "memory_service": memory,
             "confirmation_service": confirmation,
+            "discovery_controller": discovery_controller,
             "agent_runtime": AgentRuntime(
                 registry,
                 memory,
@@ -552,6 +643,8 @@ async def _run_bot(
     middleware = RepositoryMiddleware(session_factory, owner.user_id, service_factory=services)
     router.message.middleware(middleware)
     router.callback_query.middleware(middleware)
+    # Specific discovery callbacks must be registered before the catch-all fallback.
+    dispatcher.include_router(discovery_controller.router())
     dispatcher.include_router(router)
 
     async def conference_cycle_job() -> None:
@@ -664,13 +757,16 @@ async def _run_bot(
         reminder_job=reminder_job,
         test_reminder_job=test_reminder_job,
         discovery_hour=settings.discovery_hour,
+        discovery_interval_hours=settings.discovery_interval_hours,
         reminder_hour=settings.reminder_hour,
         timezone=settings.app_timezone,
     )
     scheduler.start()
+    await discovery_controller.start()
     try:
         await dispatcher.start_polling(bot)
     finally:
+        await discovery_controller.stop()
         scheduler.shutdown(wait=False)
 
 
@@ -682,6 +778,7 @@ def _build_action_executors(
     search,
     fetcher,
     application_clock: ApplicationClock | None = None,
+    enqueue_discovery=None,
 ) -> dict[str, Any]:
     async def add_topic(user_id: int, payload: AddTopicAction) -> str:
         description = payload.description.strip() or payload.name
@@ -778,10 +875,10 @@ def _build_action_executors(
         return "Запись удалена из активной памяти."
 
     async def run_discovery(user_id: int, payload: RunDiscoveryAction) -> str:
-        report = await _discovery_service(
-            session, owner_id, settings, registry, search, fetcher
-        ).run(user_id, years=list(payload.years))
-        return f"Поиск завершён. Новых конференций: {len(report.created_ids)}."
+        if enqueue_discovery is None:
+            raise ActionUnavailable("discovery queue is unavailable")
+        job = await enqueue_discovery(user_id, list(payload.years))
+        return f"Поиск поставлен в очередь (задание №{job.id})."
 
     async def upsert_deadline(user_id: int, payload: UpsertDeadlineAction) -> str:
         repository = ConferenceRepository(session)
@@ -1431,6 +1528,157 @@ def _build_read_handlers(
 
         return await with_session(operation)
 
+    async def get_discovery_search_log(user_id: int, arguments: dict) -> dict:
+        """Evidence-based search history: SearXNG results are NOT fetched pages."""
+        from conference_planner.db.models import DiscoveryJob, DiscoverySearchAudit
+
+        async def operation(session):
+            job_id = arguments.get("job_id")
+            if job_id is None:
+                job = await session.scalar(select(DiscoveryJob).where(
+                    DiscoveryJob.user_id == user_id
+                ).order_by(DiscoveryJob.id.desc()).limit(1))
+            else:
+                job = await session.scalar(select(DiscoveryJob).where(
+                    DiscoveryJob.user_id == user_id,
+                    DiscoveryJob.id == job_id,
+                ))
+            if job is None:
+                return {"status": "NO_JOB", "items": []}
+            rows = list(await session.scalars(select(DiscoverySearchAudit).where(
+                DiscoverySearchAudit.job_id == job.id,
+            ).order_by(DiscoverySearchAudit.id).limit(arguments.get("limit", 20))))
+            return {
+                "job_id": job.id,
+                "job_status": job.status,
+                "source": "SearXNG search log; not verified website visits",
+                "search_requests": sum(row.query != "[candidate page]" for row in rows),
+                "search_result_count": sum(row.result_count for row in rows if row.query != "[candidate page]"),
+                "investigated_pages": sum(row.status in ("RESEARCHED", "CATALOG_EXPANDED") for row in rows),
+                "items": [{
+                    "query": row.query, "page": row.page,
+                    "result_count": row.result_count,
+                    "retained_count": row.retained_count,
+                    "ignored_count": row.ignored_count,
+                    "status": row.status,
+                    "unresponsive_engines": row.diagnostics,
+                    "urls": row.urls[:25],
+                } for row in rows],
+            }
+
+        return await with_session(operation)
+
+    def make_research_service(session):
+        registry = _model_registry(session, profiles, settings=settings)
+        return ConferenceResearchService(
+            session, search, fetcher,
+            _research_ai_service(registry, owner.user_id),
+            max_page_bytes=settings.max_page_bytes,
+            max_page_chars=settings.max_page_text_chars,
+            application_clock=application_clock,
+            min_relevance_score=settings.min_relevance_score,
+        )
+
+    async def verify_conference_page(user_id: int, arguments: dict) -> dict:
+        from conference_planner.conferences.research import CatalogExpansion
+        from conference_planner.schemas.common import CandidateStatus
+        async def operation(session):
+            service = make_research_service(session)
+            candidate = await service.repository.get_candidate(user_id, arguments["candidate_id"])
+            if candidate.status != CandidateStatus.ACTIVE:
+                return {"candidate_id": candidate.id, "status": "NOT_ACTIVE"}
+            try:
+                result = await service.inspect(user_id, candidate.id)
+            except Exception as exc:
+                # No verification claims when the page/LLM cannot be reached.
+                return {"candidate_id": candidate.id, "url": candidate.source_url,
+                        "status": "NOT_VERIFIED", "error_type": type(exc).__name__}
+            if isinstance(result, CatalogExpansion):
+                return {"candidate_id": candidate.id, "url": candidate.source_url,
+                        "status": "CATALOG_EXPANDED", "child_ids": list(result.created_candidate_ids)}
+            return {"candidate_id": candidate.id, "url": candidate.source_url,
+                    "status": "RESEARCHED", "research": result.model_dump(mode="json")}
+        return await with_session(operation)
+
+    async def expand_conference_catalog(user_id: int, arguments: dict) -> dict:
+        result = await verify_conference_page(user_id, arguments)
+        if result.get("status") == "RESEARCHED":
+            return {"status": "SINGLE_EVENT", "candidate_id": arguments["candidate_id"],
+                    "research": result["research"]}
+        return result
+
+    async def search_official_sources(user_id: int, arguments: dict) -> dict:
+        from conference_planner.conferences.agent_tools import official_site_queries
+        from conference_planner.db.models import TrustedSource
+        from conference_planner.schemas.common import SourceType
+        async def operation(session):
+            sources = list(await session.scalars(select(TrustedSource).where(
+                TrustedSource.enabled.is_(True), TrustedSource.source_type == SourceType.DOMAIN
+            )))
+            queries = official_site_queries(arguments["topic"], arguments["year"],
+                                             [x.url for x in sources], arguments["limit"])
+            if not queries:
+                return {"status": "NO_ENABLED_OFFICIAL_DOMAINS", "queries": [], "items": []}
+            service = make_research_service(session)
+            output, errors = [], []
+            for query in queries:
+                try:
+                    candidates = await service.search(user_id, query, limit=10)
+                except Exception as exc:
+                    errors.append({"query": query, "error_type": type(exc).__name__})
+                    continue
+                output.append({"query": query, "candidates": [
+                    {"id": candidate.id, "title": candidate.title,
+                     "url": candidate.source_url, "status": "UNVERIFIED"}
+                    for candidate in candidates[:10]]})
+            return {"status": "SEARCHED" if output else "SEARCH_UNAVAILABLE",
+                    "queries": queries, "results": output, "errors": errors,
+                    "note": "SearXNG result is not proof of official conference status."}
+        return await with_session(operation)
+
+    async def verify_deadlines(user_id: int, arguments: dict) -> dict:
+        from conference_planner.conferences.agent_tools import summarize_deadlines
+        async def operation(session):
+            service = make_research_service(session)
+            candidate = await service.repository.get_candidate(user_id, arguments["candidate_id"])
+            snapshot = await service.repository.load_candidate_snapshot(user_id, candidate.id)
+            if snapshot is None:
+                return {"candidate_id": candidate.id, "status": "NOT_RESEARCHED",
+                        "next_step": "verify_conference_page"}
+            return {"candidate_id": candidate.id, **summarize_deadlines(snapshot)}
+        return await with_session(operation)
+
+    async def deduplicate_events(user_id: int, arguments: dict) -> dict:
+        from conference_planner.conferences.agent_tools import compare_events
+        from conference_planner.conferences.deduplication import CandidateIdentity
+        from conference_planner.db.models import EventCandidate
+        async def operation(session):
+            service = make_research_service(session)
+            candidate = await service.repository.get_candidate(user_id, arguments["candidate_id"])
+            accessible = await _accessible_conference_ids(session, user_id)
+            conferences = list(await session.scalars(select(Conference).where(
+                Conference.id.in_(accessible), Conference.is_test.is_(False)
+            ).limit(arguments["limit"]))) if accessible else []
+            other_candidates = list(await session.scalars(select(EventCandidate).where(
+                EventCandidate.user_id == user_id, EventCandidate.id != candidate.id
+            ).limit(arguments["limit"])))
+            identity = CandidateIdentity(candidate.id, candidate.title, candidate.start_date,
+                                         None, candidate.official_url or candidate.source_url)
+            persisted = [CandidateIdentity(x.id, x.name, x.start_date, x.acronym, x.website)
+                         for x in conferences]
+            pending = [CandidateIdentity(x.id, x.title, x.start_date, None,
+                                         x.official_url or x.source_url) for x in other_candidates]
+            return {"candidate_id": candidate.id,
+                    "persisted": compare_events(identity, persisted),
+                    "other_candidates": compare_events(identity, pending),
+                    "action": "REVIEW_ONLY", "automatic_merge": False}
+        return await with_session(operation)
+
+    async def search_strategy_refine(user_id: int, arguments: dict) -> dict:
+        from conference_planner.conferences.agent_tools import refine_queries
+        return refine_queries(arguments["topic"], arguments["year"],
+                              arguments.get("previous_queries", []))
+
     async def list_candidate_decisions(user_id: int, arguments: dict) -> dict:
         async def operation(session):
             status = CandidateStatus(arguments["status"])
@@ -1487,6 +1735,13 @@ def _build_read_handlers(
         "cancel_agent_run": cancel_agent_run,
         "propose_persist_agent_candidate": persist_agent_candidate,
         "list_agent_progress": list_agent_progress,
+        "get_discovery_search_log": get_discovery_search_log,
+        "verify_conference_page": verify_conference_page,
+        "search_official_sources": search_official_sources,
+        "expand_conference_catalog": expand_conference_catalog,
+        "verify_deadlines": verify_deadlines,
+        "deduplicate_events": deduplicate_events,
+        "search_strategy_refine": search_strategy_refine,
         "list_candidate_decisions": list_candidate_decisions,
     }
 

@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from typing import Protocol
+from collections.abc import Awaitable, Callable
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,7 +70,10 @@ class DiscoveryService:
         self.max_page_bytes = max_page_bytes
         self.max_page_chars = max_page_chars
 
-    async def run(self, user_id: int, *, years: list[int]) -> DiscoveryReport:
+    async def run(
+        self, user_id: int, *, years: list[int],
+        on_progress: Callable[[DiscoveryReport, str], Awaitable[None]] | None = None,
+    ) -> DiscoveryReport:
         report = DiscoveryReport()
         topics = list(
             await self.session.scalars(
@@ -87,6 +91,9 @@ class DiscoveryService:
                 if page_url not in seen_urls:
                     seen_urls.add(page_url)
                     await self._process_candidate(page_url, topic, report)
+                    await self.session.commit()
+                    if on_progress:
+                        await on_progress(report, page_url)
             for query in generate_queries(topic.keywords, years, domains):
                 try:
                     results = await self.search.search(query)
@@ -99,6 +106,9 @@ class DiscoveryService:
                         continue
                     seen_urls.add(url)
                     await self._process_candidate(url, topic, report)
+                    await self.session.commit()
+                    if on_progress:
+                        await on_progress(report, url)
         await self.session.commit()
         return report
 

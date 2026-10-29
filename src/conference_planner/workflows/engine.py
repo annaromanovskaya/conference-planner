@@ -159,6 +159,8 @@ class WorkflowEngine:
         try:
             async with asyncio.timeout(budget.timeout_seconds):
                 while task := await self.repository.claim_ready_task(run_id):
+                    # Release SQLite write lock before callbacks and network/LLM calls.
+                    await self.repository.session.commit()
                     result = await self._execute_task(run, task, budget, progress)
                     if result is not None:
                         return result
@@ -184,6 +186,9 @@ class WorkflowEngine:
             return AgentRunView.model_validate(await self.repository.get_run_by_id(run.id))
         dependencies = await self._dependency_artifacts(run.id, task)
         usage = self._usage(run)
+        # Read queries implicitly begin transactions. Release them before a
+        # progress sink writes through an independent SQLite connection.
+        await self.repository.session.commit()
         await self._emit(
             progress,
             run.id,

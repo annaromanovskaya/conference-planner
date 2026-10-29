@@ -102,6 +102,7 @@ def build_router(*, owner_telegram_id: int) -> Router:
         conference_cycle_service,
         conference_research_repository,
         conference_research_service,
+        discovery_controller,
         owner_user_id: int,
     ) -> None:
         await handle_search_query(
@@ -111,6 +112,7 @@ def build_router(*, owner_telegram_id: int) -> Router:
             owner_user_id=owner_user_id,
             candidate_repository=conference_research_repository,
             candidate_research_service=conference_research_service,
+            discovery_controller=discovery_controller,
         )
 
     @router.callback_query(F.data == "topic:add")

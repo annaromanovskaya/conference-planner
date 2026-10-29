@@ -13,17 +13,18 @@ def configure_scheduler(
     reminder_job: AsyncJob,
     test_reminder_job: AsyncJob,
     discovery_hour: int,
+    discovery_interval_hours: int = 168,
     reminder_hour: int,
     timezone: str,
 ) -> None:
+    if discovery_interval_hours < 1:
+        raise ValueError("discovery_interval_hours must be positive")
     common = {"replace_existing": True, "coalesce": True, "max_instances": 1}
     scheduler.add_job(
         conference_cycle_job,
-        "cron",
-        id="weekly-conference-cycle",
-        day_of_week="mon",
-        hour=discovery_hour,
-        timezone=timezone,
+        "interval",
+        id="periodic-conference-cycle",
+        hours=discovery_interval_hours,
         **common,
     )
     scheduler.add_job(

@@ -1,6 +1,7 @@
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from difflib import SequenceMatcher
@@ -14,6 +15,8 @@ from conference_planner.ai.gateway import ModelGatewayError
 from conference_planner.ai.service import AIResponseError
 from conference_planner.conferences.candidate_policy import (
     TopicRelevanceContext,
+    clearly_not_conference,
+    has_scientific_event_evidence,
     evaluate_keyword_relevance,
     is_expired_research,
 )
@@ -33,7 +36,7 @@ from conference_planner.conferences.temporal import (
     extract_temporal_research,
     merge_temporal_research,
 )
-from conference_planner.db.models import EventCandidate
+from conference_planner.db.models import EventCandidate, DiscoverySearchAudit, TrustedSource
 from conference_planner.db.repositories.conference_research import (
     CandidateDraft,
     ConferenceResearchRepository,
@@ -47,6 +50,7 @@ from conference_planner.schemas.common import (
     CandidateStatus,
     EvidenceSourceClass,
     VerificationStatus,
+    SourceType,
 )
 from conference_planner.schemas.research import (
     ConferenceCatalogResearch,
@@ -160,8 +164,10 @@ class ConferenceResearchService:
         application_clock: ApplicationClock | None = None,
         min_relevance_score: float = 0.5,
         cache: WebDocumentCacheRepository | None = None,
+        discovery_job_id: int | None = None,
     ) -> None:
         self.session = session
+        self.discovery_job_id = discovery_job_id
         self.search_provider = search
         self.fetcher = fetcher
         self.ai = ai
@@ -190,21 +196,47 @@ class ConferenceResearchService:
         bounded_limit = max(1, min(limit, self.MAX_PAGE_RESULTS))
         topics = await self._topic_contexts(user_id)
         effective_query = search_query or self._dated_search_query(query)
-        search_page = await self._search_page(effective_query, page=page)
+        try:
+            search_page = await self._search_page(effective_query, page=page)
+        except Exception as exc:
+            if self.discovery_job_id is not None:
+                self.session.add(DiscoverySearchAudit(
+                    job_id=self.discovery_job_id, query=effective_query, page=page,
+                    result_count=0, retained_count=0, ignored_count=0,
+                    status="SEARCH_ERROR", diagnostics=[type(exc).__name__], urls=[],
+                ))
+                await self.session.commit()
+            raise
         raw_results = list(search_page.results[:bounded_limit])
         self.last_search_result_count = len(raw_results)
         self.last_search_unresponsive_engines = search_page.unresponsive_engines
         drafts: list[CandidateDraft] = []
+        inspected_results: list[dict] = []
         seen_identities: set[tuple[str, str]] = set()
         for position, result in enumerate(raw_results):
             url = str(result.url)
             normalized_url = canonical_url(url) or url
             identity = (normalized_url, normalize_name(result.title))
             if identity in seen_identities:
+                inspected_results.append({"url": url, "decision": "DUPLICATE"})
+                continue
+            if clearly_not_conference(result.title, result.snippet):
+                inspected_results.append({"url": url, "decision": "NON_CONFERENCE"})
+                continue
+            if not has_scientific_event_evidence(result.title, result.snippet, url):
+                inspected_results.append({"url": url, "decision": "NO_EVENT_EVIDENCE"})
                 continue
             keyword_relevance = evaluate_keyword_relevance(result.title, result.snippet, topics)
-            if keyword_relevance.explicitly_irrelevant:
+            # Relevance of an explicitly named scientific meeting must be checked
+            # on its official page rather than inferred from the short snippet.
+            official_meeting = bool(re.search(
+                r"(?:^|\.)iau\.org$|(?:^|\.)eso\.org$|(?:^|\.)aas\.org$",
+                urlsplit(url).hostname or "", re.I
+            )) and has_scientific_event_evidence(result.title, result.snippet, url)
+            if keyword_relevance.explicitly_irrelevant and not official_meeting:
+                inspected_results.append({"url": url, "decision": "TOPIC_MISMATCH"})
                 continue
+            inspected_results.append({"url": url, "decision": "UNVERIFIED_CANDIDATE"})
             seen_identities.add(identity)
             drafts.append(
                 CandidateDraft(
@@ -238,6 +270,16 @@ class ConferenceResearchService:
             drafts,
             expires_at=datetime.now(UTC) + self.candidate_ttl,
         )
+        if self.discovery_job_id is not None:
+            self.session.add(DiscoverySearchAudit(
+                job_id=self.discovery_job_id,
+                query=effective_query, page=page,
+                result_count=len(raw_results), retained_count=len(drafts),
+                ignored_count=len(raw_results) - len(drafts),
+                status="EMPTY" if not raw_results else "RESULTS_RECEIVED",
+                diagnostics=list(search_page.unresponsive_engines),
+                urls=inspected_results,
+            ))
         await self.session.commit()
         self.last_search_new_ids = tuple(
             item.id
@@ -251,6 +293,132 @@ class ConferenceResearchService:
             len(drafts) - self.last_search_new_count,
         )
         return [item for item in stored if item.status == CandidateStatus.ACTIVE]
+
+    async def search_trusted_sources(
+        self,
+        user_id: int,
+        query: str,
+        *,
+        max_sources: int = 12,
+        max_links_per_source: int = 15,
+        max_depth: int = 2,
+        max_pages: int = 24,
+    ) -> dict:
+        """Bounded, independent crawl of enabled user sources, without SearXNG.
+
+        Counts actual fetched pages and records each URL and decision. Extracted
+        URLs remain UNVERIFIABLE until inspect() validates source evidence.
+        """
+        sources = list(await self.session.scalars(
+            select(TrustedSource).where(TrustedSource.enabled.is_(True))
+            .order_by(TrustedSource.id).limit(max_sources)
+        ))
+        years = set(re.findall(r"\b20\d{2}\b", query))
+        seen: set[str] = set()
+        queued: set[str] = set()
+        queue: deque[tuple[str, int, str, str]] = deque()
+        for source in sources:
+            if source.source_type in {SourceType.PAGE, SourceType.DOMAIN}:
+                queue.append((source.url, 0, source.url, source.name))
+                queued.add(canonical_url(source.url) or source.url)
+        added_ids: list[int] = []
+        errors: list[str] = []
+        opened = 0
+        inspected_candidates: set[str] = set()
+        while queue and opened < max_pages and len(inspected_candidates) < 60:
+            url, depth, root, label = queue.popleft()
+            key = canonical_url(url) or url
+            if key in seen:
+                continue
+            seen.add(key)
+            log_urls = [{"url": url, "decision": "FETCH_ATTEMPT", "depth": depth}]
+            try:
+                page = await self.fetcher.fetch(url, max_bytes=self.max_page_bytes)
+                opened += 1
+                page_text = extract_page_text(page.html, max_chars=self.max_page_chars)
+                links = extract_page_links(page.html, page.url, max_links=200)
+                log_urls[0]["decision"] = "SOURCE_OPENED" if depth == 0 else "CATALOG_OPENED"
+                # A catalog is recognised from both URL and anchor semantics.
+                catalog_links = 0
+                drafts: list[CandidateDraft] = []
+                for link in links:
+                    target = canonical_url(link.url) or link.url
+                    if target in seen or target == key:
+                        continue
+                    text = f"{link.text} {link.url}"
+                    # HTML crawler cannot parse PDF/Word. Do not queue these as pages.
+                    if re.search(r"\.(?:pdf|docx?|xlsx?|pptx?|zip)(?:[?#]|$)", link.url, re.I):
+                        log_urls.append({"url": link.url, "decision": "DOCUMENT_SKIPPED"})
+                        continue
+                    if clearly_not_conference(link.text, text):
+                        continue
+                    # Reject explicitly outdated editions; year-less annual
+                    # index links are still eligible for further exploration.
+                    mentioned = set(re.findall(r"(?<!\d)20\d{2}(?!\d)", text))
+                    if years and mentioned and not (mentioned & years):
+                        log_urls.append({"url": link.url, "decision": "OTHER_YEAR"})
+                        continue
+                    event = has_scientific_event_evidence(link.text, text, link.url)
+                    if not event:
+                        continue
+                    # Pages looking like directories get an additional crawl
+                    # step; a dedicated conference page may also be checked
+                    # through inspect(), without trusting its title alone.
+                    directory = bool(re.search(
+                        r"(?:/meetings/?$|/conference/?$|/conferences/?$|"
+                        r"/events/?$|/meetings/(?:recent|this-month|garching)/?$|"
+                        r"/conference/(?:index|annconf)/?)", link.url, re.I
+                    ))
+                    if directory and depth < max_depth and target not in queued:
+                        queue.append((link.url, depth + 1, root, label))
+                        queued.add(target)
+                        catalog_links += 1
+                        log_urls.append({"url": link.url, "decision": "CATALOG_QUEUED"})
+                    elif len(drafts) < max_links_per_source and target not in inspected_candidates:
+                        inspected_candidates.add(target)
+                        drafts.append(CandidateDraft(
+                            title=link.text[:500], source_url=link.url,
+                            query=query, relevance_score=0.5,
+                            summary=f"Linked from trusted source: {page.url}",
+                            verification_status=VerificationStatus.UNVERIFIABLE,
+                        ))
+                        log_urls.append({"url": link.url, "decision": "UNVERIFIED_CANDIDATE"})
+                existing = set(await self.session.scalars(
+                    select(EventCandidate.source_url).where(
+                        EventCandidate.user_id == user_id,
+                        EventCandidate.source_url.in_([d.source_url for d in drafts]),
+                    )
+                )) if drafts else set()
+                stored = await self.repository.create_candidates(
+                    user_id, drafts, expires_at=datetime.now(UTC) + self.candidate_ttl,
+                )
+                added_ids.extend(c.id for c in stored
+                                 if c.source_url not in existing and c.id not in added_ids)
+                if self.discovery_job_id is not None:
+                    self.session.add(DiscoverySearchAudit(
+                        job_id=self.discovery_job_id,
+                        query=f"[trusted source] {page.url}", page=depth + 1,
+                        result_count=len(links), retained_count=len(drafts),
+                        ignored_count=max(0, len(links) - len(drafts) - catalog_links),
+                        status="SOURCE_OPENED" if depth == 0 else "CATALOG_OPENED",
+                        diagnostics=[], urls=log_urls,
+                    ))
+                await self.session.commit()
+            except Exception as exc:
+                await self.session.rollback()
+                errors.append(f"{url}: {type(exc).__name__}")
+                if self.discovery_job_id is not None:
+                    self.session.add(DiscoverySearchAudit(
+                        job_id=self.discovery_job_id,
+                        query=f"[trusted source] {url}", page=depth + 1,
+                        result_count=0, retained_count=0, ignored_count=0,
+                        status="SOURCE_ERROR", diagnostics=[type(exc).__name__],
+                        urls=[{"url": url, "decision": "SOURCE_UNAVAILABLE", "depth": depth}],
+                    ))
+                    await self.session.commit()
+        return {"new_ids": tuple(added_ids), "sources_opened": opened,
+                "sources_total": len(sources), "errors": tuple(errors),
+                "pending_catalogs": len(queue)}
 
     async def search_fresh(
         self,
@@ -268,9 +436,13 @@ class ConferenceResearchService:
         exhausted = False
         pages_checked = 0
         diagnostics: list[str] = []
+        searches_issued = 0
 
         async def attempt(page: int, search_query: str | None = None) -> None:
-            nonlocal duplicates, pages_checked
+            nonlocal duplicates, pages_checked, searches_issued
+            if searches_issued:
+                await asyncio.sleep(1.5)  # Avoid bursts against upstream engines.
+            searches_issued += 1
             candidates = await self.search(
                 user_id,
                 query,
@@ -290,8 +462,12 @@ class ConferenceResearchService:
                     new_ids.append(candidate_id)
             duplicates += self.last_search_duplicate_count
 
-        await attempt(1)
-        if self.last_search_result_count == 0:
+        generic_topics = bool(re.search(
+            r"моим\s+тем|по\s+моим\s+тем|my\s+topics", query.casefold()
+        ))
+        if not generic_topics:
+            await attempt(1)
+        if not generic_topics and self.last_search_result_count == 0:
             await self._wait_before_search_retry(1.0)
             english_query = await self._english_search_query(query)
             await attempt(1, english_query)
@@ -299,12 +475,41 @@ class ConferenceResearchService:
                 await self._wait_before_search_retry(2.0)
                 await attempt(2, english_query)
             exhausted = self.last_search_result_count == 0
-        elif not new_ids:
+            if exhausted and bounded_pages > 1:
+                year = " ".join(dict.fromkeys(re.findall(r"\b20\d{2}\b", query)))
+                for topic_term in ("stellar spectroscopy", "astrophysics", "astronomy"):
+                    await attempt(1, f"{topic_term} conference {year} abstract submission".strip())
+                    if self.last_search_result_count:
+                        exhausted = False
+                        break
+        elif not generic_topics and not new_ids:
             for page in range(2, bounded_pages + 1):
                 await attempt(page)
                 if new_ids or self.last_search_result_count == 0:
                     exhausted = self.last_search_result_count == 0
                     break
+
+        # A generic "find conferences relevant to my topics" is not a useful
+        # web query. Expand it to the owner's actual enabled research topics.
+        # Search each topic with its own query; keep strict budget bounds.
+        if generic_topics:
+            topics = await self._topic_contexts(user_id)
+            year = " ".join(dict.fromkeys(re.findall(r"\b20\d{2}\b", query)))
+            # Use stable short domain phrases; an LLM translation may turn
+            # 'high-resolution' into consumer electronics or 'chemical' into
+            # a dictionary lookup when search engines are degraded.
+            searched: set[str] = set()
+            for topic in topics[:8]:
+                title = topic.name.strip()
+                if not title:
+                    continue
+                key = self._scientific_search_topic(title)
+                search_text = f'"{key}" conference {year}'.strip()
+                if search_text in searched:
+                    continue
+                searched.add(search_text)
+                await attempt(1, search_text)
+            exhausted = not active_ids and not new_ids
 
         return CandidateSearchReport(
             active_ids=tuple(active_ids),
@@ -316,10 +521,33 @@ class ConferenceResearchService:
             error_code=(
                 "SEARCH_UNAVAILABLE"
                 if exhausted and diagnostics
-                else "SEARCH_EMPTY" if exhausted else None
+                else "SEARCH_EMPTY" if exhausted else
+                "NO_RELEVANT_RESULTS" if not active_ids else None
             ),
             unresponsive_engines=tuple(diagnostics),
         )
+
+    @staticmethod
+    def _scientific_search_topic(value: str) -> str:
+        lower = value.casefold()
+        translations = (
+            ("спектроскоп", "stellar spectroscopy"),
+            ("химическ", "stellar chemical abundances"),
+            ("пекуляр", "chemically peculiar stars"),
+            ("двойн", "spectroscopic binary stars"),
+            ("магнит", "magnetic stars"),
+            ("машинн", "machine learning astronomy"),
+            ("атмосфер", "stellar atmospheres"),
+            ("астрофиз", "astrophysics"),
+            ("астрохим", "astrochemistry"),
+            ("звездообраз", "star formation"),
+        )
+        for fragment, label in translations:
+            if fragment in lower:
+                return label
+        # Preserve scientific phrases from user settings; avoid broad keywords.
+        stripped = re.sub(r"[^a-zA-Z0-9\s-]", " ", value)
+        return " ".join(stripped.split())[:75] or "astronomy"
 
     async def _wait_before_search_retry(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -332,18 +560,8 @@ class ConferenceResearchService:
         return SearchPage(tuple(results))
 
     def _dated_search_query(self, query: str, *, english: bool = False) -> str:
-        if self.application_clock is None:
-            return query
-        current_date = self.application_clock.today().isoformat()
-        if english:
-            return (
-                f"{query}. Current date: {current_date}. "
-                "Only upcoming scientific events."
-            )
-        return (
-            f"{query}. Текущая дата: {current_date}. "
-            "Искать только ещё не завершившиеся научные мероприятия."
-        )
+        """Use search keywords only; dates belong to extraction/verification."""
+        return " ".join(query.split())[:240]
 
     async def _english_search_query(self, query: str) -> str:
         translator = getattr(self.ai, "translate_search_query", None)
@@ -395,6 +613,16 @@ class ConferenceResearchService:
             if siblings:
                 return CatalogExpansion(candidate.id, tuple(item.id for item in siblings))
         candidate = await self._require_active(user_id, candidate_id)
+        if clearly_not_conference(candidate.title, candidate.summary):
+            await self.repository.transition_candidate(
+                user_id, candidate_id,
+                CandidateStatus.REJECTED,
+                CandidateDecisionReason.LOW_RELEVANCE,
+                CandidateDecisionSource.SYSTEM,
+                self._now(),
+            )
+            await self.session.commit()
+            raise CandidateRejectedError("search result is clearly not a conference")
         await self._report(progress, f"Открываю сайт: {candidate.source_url}")
         page, page_text, page_links = await self._fetch_candidate_page(candidate)
         primary_documents = (EvidenceDocument(page.url, page_text),)

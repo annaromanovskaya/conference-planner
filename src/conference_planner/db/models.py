@@ -607,3 +607,45 @@ class AgentProgressEvent(Base):
 
 
 JsonMapping = dict[str, Any]
+
+
+class DiscoveryJob(Base):
+    """Durable Telegram-facing queue around an agent workflow."""
+    __tablename__ = "discovery_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    years: Mapped[list[int]] = mapped_column(JSON)
+    query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), index=True, default="QUEUED")
+    stage: Mapped[str] = mapped_column(String(50), default="QUEUED")
+    processed: Mapped[int] = mapped_column(default=0)
+    total: Mapped[int | None] = mapped_column(nullable=True)
+    found: Mapped[int] = mapped_column(default=0)
+    rejected: Mapped[int] = mapped_column(default=0)
+    errors: Mapped[int] = mapped_column(default=0)
+    agent_run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(nullable=True)
+    report_message_id: Mapped[int | None] = mapped_column(nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+    notified: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class DiscoverySearchAudit(Base):
+    """Immutable per-search-request evidence for agent discovery."""
+    __tablename__ = "discovery_search_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("discovery_jobs.id", ondelete="CASCADE"), index=True)
+    query: Mapped[str] = mapped_column(Text)
+    page: Mapped[int] = mapped_column(default=1)
+    result_count: Mapped[int] = mapped_column(default=0)
+    retained_count: Mapped[int] = mapped_column(default=0)
+    ignored_count: Mapped[int] = mapped_column(default=0)
+    status: Mapped[str] = mapped_column(String(30))
+    diagnostics: Mapped[list[str]] = mapped_column(JSON, default=list)
+    urls: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)

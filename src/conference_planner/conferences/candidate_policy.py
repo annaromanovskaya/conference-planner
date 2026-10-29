@@ -57,6 +57,30 @@ def evaluate_keyword_relevance(
     return KeywordRelevance(0.0, (), bool(candidate_tokens))
 
 
+# Conservative high-confidence exclusion. Uncertain results must proceed to
+# source verification instead of being rejected based on absent keywords.
+_EVENT_MARKERS = re.compile(
+    r"\b(?:conference|congress|symposium|workshop|colloquium|meeting|"
+    r"school|seminar|abstracts?|scientific\s+events?|конференци[яиюей]|"
+    r"симпозиум|конгресс|семинар|тезис[ыов])\b",
+    re.IGNORECASE,
+)
+_NON_EVENT_MARKERS = re.compile(
+    r"\b(?:faq|hilfe\s+und\s+kontakt|kundendienst|"
+    r"tarifen?|mobilfunktarif|handyvertrag|vertragsverlängerung|"
+    r"phone\s+plans?|mobile\s+plans?|customer\s+support|"
+    r"shopping\s+cart|checkout|product\s+support|"
+    r"мобильн(?:ый|ые)\s+тариф|служба\s+поддержки)\b",
+    re.IGNORECASE,
+)
+
+
+def clearly_not_conference(title: str, summary: str | None = None) -> bool:
+    """Exclude unmistakable consumer/service pages, never ambiguous science pages."""
+    content = f"{title} {summary or ''}"
+    return bool(_NON_EVENT_MARKERS.search(content) and not _EVENT_MARKERS.search(content))
+
+
 def research_event_range(
     research: VerifiedConferenceResearch,
 ) -> tuple[date | None, date | None]:
@@ -86,3 +110,25 @@ def _parse_iso_date(value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+# Search engine snippets are untrusted leads, not confirmed scientific events.
+# Require evidence of an event before adding a lead to the user's review queue.
+_STRONG_EVENT_MARKERS = re.compile(
+    r"\b(?:conference|conferences|congress|symposium|symposia|workshop|"
+    r"colloquium|meetings?|scientific\s+school|call\s+for\s+(?:papers|abstracts)|"
+    r"abstract\s+submission|registration\s+(?:is\s+)?open|"
+    r"конференци[яиюей]|симпозиум|конгресс|коллоквиум|"
+    r"школа[- ]семинар|при[её]м\s+тезисов)\b", re.IGNORECASE,
+)
+_EVENT_URL_HINTS = re.compile(
+    r"/(?:meetings?|conferences?|symposia|symposium|workshops?|events?)/|"
+    r"(?:^|[.-])(?:meetings?|conferences?|symposium|workshop)(?:[.-]|$)",
+    re.IGNORECASE,
+)
+
+
+def has_scientific_event_evidence(title: str, summary: str | None, url: str) -> bool:
+    """Presence of event evidence in a search hit (not a source verification)."""
+    content = f"{title} {summary or ''}"
+    return bool(_STRONG_EVENT_MARKERS.search(content) or _EVENT_URL_HINTS.search(url))

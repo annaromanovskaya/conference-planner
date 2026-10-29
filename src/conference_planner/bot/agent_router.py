@@ -153,6 +153,7 @@ def build_agent_router() -> Router:
         conference_research_repository,
         conference_research_service,
         confirmation_service,
+        discovery_controller,
         owner_user_id: int,
     ) -> None:
         await handle_free_text(
@@ -164,6 +165,7 @@ def build_agent_router() -> Router:
             candidate_repository=conference_research_repository,
             candidate_research_service=conference_research_service,
             confirmation_service=confirmation_service,
+            discovery_controller=discovery_controller,
         )
 
     return router
@@ -184,8 +186,15 @@ async def handle_free_text(
     candidate_repository=None,
     candidate_research_service=None,
     confirmation_service=None,
+    discovery_controller=None,
 ) -> None:
     text = message.text or ""
+    if discovery_controller is not None and re.search(
+        r"(какие|список|покажи|отчет|отчёт).{0,70}(страниц|ссылок|сайтов|проверен|искал|запросов)",
+        text.casefold(),
+    ):
+        await message.answer(await discovery_controller.latest_search_report(owner_user_id))
+        return
     memory_action = memory_action_from_text(text)
     if memory_action is not None and confirmation_service is not None:
         await state.clear()
@@ -211,6 +220,7 @@ async def handle_free_text(
             owner_user_id=owner_user_id,
             candidate_repository=candidate_repository,
             candidate_research_service=candidate_research_service,
+            discovery_controller=discovery_controller,
         )
         return
     await handle_agent_message(message, agent_runtime, owner_user_id=owner_user_id)
@@ -318,9 +328,13 @@ async def handle_search_query(
     owner_user_id: int,
     candidate_repository=None,
     candidate_research_service=None,
+    discovery_controller=None,
 ) -> None:
     await state.clear()
     query = (message.text or "").strip()
+    if discovery_controller is not None:
+        await discovery_controller.enqueue_query(owner_user_id, query, message)
+        return
     lock = _CHAT_LOCKS.setdefault(message.chat.id, asyncio.Lock())
     if lock.locked():
         await message.answer(

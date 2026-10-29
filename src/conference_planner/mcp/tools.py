@@ -28,6 +28,13 @@ READ_TOOL_NAMES = {
     "cancel_agent_run",
     "propose_persist_agent_candidate",
     "list_agent_progress",
+    "get_discovery_search_log",
+    "verify_conference_page",
+    "search_official_sources",
+    "expand_conference_catalog",
+    "verify_deadlines",
+    "deduplicate_events",
+    "search_strategy_refine",
     "list_candidate_decisions",
 }
 

@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     reader_fallback_url: HttpUrl | None = HttpUrl("https://r.jina.ai")
     discovery_day: str = "sun"
     discovery_hour: int = Field(default=10, ge=0, le=23)
+    discovery_interval_hours: int = Field(default=168, ge=1, le=720)
     reminder_hour: int = Field(default=9, ge=0, le=23)
     monitoring_hour: int = Field(default=9, ge=0, le=23)
     monitoring_interval_hours: int = Field(default=72, ge=24, le=720)

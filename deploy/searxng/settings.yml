@@ -1,18 +1,32 @@
-use_default_settings: true
+# Private single-client SearXNG used by Conference Planner.
+# A small set of engines reduces rate-limit pressure but cannot prevent 403/429.
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - mojeek
+      - yahoo
 server:
   bind_address: 0.0.0.0
   port: 8080
   secret_key: "conference-planner-internal-only"
+  limiter: false
 search:
+  default_lang: en
   formats:
     - html
     - json
+  ban_time_on_fail: 60
+  max_ban_time_on_fail: 3600
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 15.0
+  pool_connections: 10
+  enable_http2: true
 engines:
   - name: bing
     disabled: false
-  - name: google
+  - name: mojeek
     disabled: false
-  - name: qwant
-    disabled: false
-  - name: startpage
+  - name: yahoo
     disabled: false
