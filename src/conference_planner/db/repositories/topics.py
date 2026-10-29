@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conference_planner.db.models import Topic
@@ -27,6 +27,19 @@ class TopicRepository:
         self.session.add(topic)
         await self.session.flush()
         return topic
+
+    async def get_for_user(self, user_id: int, topic_id: int) -> Topic | None:
+        return await self.session.scalar(
+            select(Topic).where(Topic.id == topic_id, Topic.user_id == user_id)
+        )
+
+    async def delete_for_user(self, user_id: int, topic_id: int) -> str | None:
+        result = await self.session.execute(
+            delete(Topic)
+            .where(Topic.id == topic_id, Topic.user_id == user_id)
+            .returning(Topic.name)
+        )
+        return result.scalar_one_or_none()
 
     async def set_enabled(self, topic_id: int, enabled: bool) -> None:
         topic = await self.session.get(Topic, topic_id)

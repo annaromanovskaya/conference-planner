@@ -118,6 +118,9 @@ class Conference(TimestampMixin, Base):
     )
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_test: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    is_catalog_source: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), index=True
+    )
 
     deadlines: Mapped[list["Deadline"]] = relationship(
         back_populates="conference", cascade="all, delete-orphan"

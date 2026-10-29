@@ -8,6 +8,7 @@ from conference_planner.schemas.agent import ActionPayload, PendingActionView
 
 READ_TOOL_NAMES = {
     "list_topics",
+    "list_sources",
     "list_conferences",
     "find_conferences",
     "get_conference_context",
@@ -17,6 +18,7 @@ READ_TOOL_NAMES = {
     "list_memories",
     "get_active_model",
     "search_conference_candidates",
+    "list_pending_candidates",
     "get_candidate",
     "list_conference_details",
     "check_tracked_conference",
@@ -31,8 +33,11 @@ READ_TOOL_NAMES = {
 
 PROPOSAL_TOOL_NAMES = {
     "propose_add_topic",
+    "propose_delete_topic",
     "propose_add_source",
+    "propose_delete_source",
     "propose_track_conference",
+    "propose_delete_conference",
     "propose_add_candidate",
     "propose_import_conference_url",
     "propose_archive_conference",
@@ -61,6 +66,9 @@ class MCPToolServices:
     async def read(self, name: str, arguments: dict[str, Any]) -> Any:
         if name not in READ_TOOL_NAMES:
             raise ValueError("tool is not approved")
+        return await self.internal_read(name, arguments)
+
+    async def internal_read(self, name: str, arguments: dict[str, Any]) -> Any:
         handler = self.read_handlers.get(name)
         if handler is None:
             raise ToolError("tool is temporarily unavailable")

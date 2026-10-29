@@ -1,8 +1,17 @@
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from conference_planner.ai.models import ChatMessage
 from conference_planner.ai.registry import ModelRegistry
 from conference_planner.schemas.common import ModelRole
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallMetadata:
+    profile_id: str
+    requested_model_name: str
+    model_name: str | None
 
 
 class ActiveLLMProvider:
@@ -17,6 +26,14 @@ class ActiveLLMProvider:
         self.registry = registry
         self.user_id = user_id
         self.role = role
+        self._last_call: ContextVar[ModelCallMetadata | None] = ContextVar(
+            f"last_model_call_{id(self)}",
+            default=None,
+        )
+
+    @property
+    def last_call(self) -> ModelCallMetadata | None:
+        return self._last_call.get()
 
     async def complete(
         self,
@@ -38,5 +55,12 @@ class ActiveLLMProvider:
                 ChatMessage(role="user", content=user_prompt),
             ],
             response_schema=response_schema,
+        )
+        self._last_call.set(
+            ModelCallMetadata(
+                profile_id=active.profile_id,
+                requested_model_name=active.model_name,
+                model_name=response.model_name,
+            )
         )
         return response.content

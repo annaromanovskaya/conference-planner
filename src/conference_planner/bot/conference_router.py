@@ -12,6 +12,7 @@ from conference_planner.bot.keyboards import (
     candidate_decision_actions,
     candidate_review_actions,
     conference_actions,
+    conference_management,
 )
 from conference_planner.conferences.monitoring import MonitoringCheckError
 from conference_planner.conferences.research import (
@@ -30,6 +31,7 @@ from conference_planner.schemas.common import (
 )
 from conference_planner.schemas.research import VerifiedConferenceResearch
 from conference_planner.web.fetcher import FetchError
+from conference_planner.web.access import safe_public_link
 
 _RU_MONTHS = (
     "",
@@ -222,6 +224,7 @@ async def send_next_candidate(
             await message.answer(
                 f"Не удалось открыть сайт кандидата: {exc.user_message} "
                 "Кандидат оставлен в очереди."
+                + (f"\nОткройте сайт самостоятельно: {safe_public_link(exc.url)}" if exc.url and safe_public_link(exc.url) else "")
             )
         except (AIResponseError, ModelGatewayError):
             await message.answer(
@@ -251,7 +254,11 @@ async def send_conference_overview(
     candidates,
     archived,
 ) -> None:
-    await message.answer(conference_lists_text(tracked, candidates, archived), parse_mode="HTML")
+    await message.answer(
+        conference_lists_text(tracked, candidates, archived),
+        reply_markup=conference_management(tracked, archived),
+        parse_mode="HTML",
+    )
 
 
 async def handle_candidate_details(
@@ -560,6 +567,7 @@ def build_conference_router() -> Router:
         except FetchError as exc:
             await callback.message.answer(
                 f"Не удалось открыть страницу: {exc.user_message} Кандидат остался в очереди."
+                + (f"\nОткройте сайт самостоятельно: {safe_public_link(exc.url)}" if exc.url and safe_public_link(exc.url) else "")
             )
             return
         except (AIResponseError, ModelGatewayError):

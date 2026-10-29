@@ -7,3 +7,12 @@ search:
   formats:
     - html
     - json
+engines:
+  - name: bing
+    disabled: false
+  - name: google
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: startpage
+    disabled: false

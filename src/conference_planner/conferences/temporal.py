@@ -254,13 +254,18 @@ def merge_temporal_research(
     primary: ConferenceResearch,
     deterministic: ConferenceResearch,
 ) -> ConferenceResearch:
-    if primary.source_class == EvidenceSourceClass.SECONDARY:
-        facts = [_as_secondary(claim) for claim in deterministic.facts]
+    if primary.source_class != EvidenceSourceClass.OFFICIAL_CONFERENCE:
+        facts = [
+            _as_source_class(claim, primary.source_class) for claim in deterministic.facts
+        ]
         fact_keys = {(claim.kind, claim.value) for claim in facts}
         facts.extend(
             claim for claim in primary.facts if (claim.kind, claim.value) not in fact_keys
         )
-        deadlines = [_as_secondary(claim) for claim in deterministic.deadlines]
+        deadlines = [
+            _as_source_class(claim, primary.source_class)
+            for claim in deterministic.deadlines
+        ]
         deadline_keys = {_deadline_identity(claim) for claim in deadlines}
         specific_dates = {
             _deadline_temporal_identity(claim)
@@ -588,15 +593,18 @@ def _add_catalog_official_url(
     )
 
 
-def _as_secondary(claim: FactClaim | DeadlineClaim) -> FactClaim | DeadlineClaim:
+def _as_source_class(
+    claim: FactClaim | DeadlineClaim,
+    source_class: EvidenceSourceClass,
+) -> FactClaim | DeadlineClaim:
     status = (
         VerificationStatus.TENTATIVE
         if claim.verification_status == VerificationStatus.TENTATIVE
-        else VerificationStatus.SECONDARY_UNVERIFIED
+        else _claim_status(source_class)
     )
     return claim.model_copy(
         update={
-            "source_class": EvidenceSourceClass.SECONDARY,
+            "source_class": source_class,
             "verification_status": status,
         }
     )

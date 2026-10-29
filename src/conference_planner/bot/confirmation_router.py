@@ -68,6 +68,9 @@ async def confirm_action(
             "action expired": "Срок подтверждения истёк.",
             "action cancelled": "Действие уже отменено.",
             "action not found": "Действие не найдено.",
+            "topic not found": "Тема уже удалена или недоступна.",
+            "source not found": "Источник уже удалён или недоступен.",
+            "conference not found": "Конференция уже удалена или недоступна.",
             "action execution failed": (
                 "Не удалось проверить или сохранить кандидата. Он остался в очереди; "
                 "попробуйте ещё раз позже."

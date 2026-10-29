@@ -3,6 +3,7 @@ from datetime import date
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -12,6 +13,9 @@ from conference_planner.schemas.agent import (
     AddSourceAction,
     AddTopicAction,
     ArchiveConferenceAction,
+    DeleteConferenceAction,
+    DeleteSourceAction,
+    DeleteTopicAction,
     ForgetMemoryAction,
     ImportConferenceCandidateAction,
     ImportConferenceURLAction,
@@ -56,6 +60,16 @@ def build_mcp_server(services: MCPToolServices) -> MCPServer:
     )
     async def list_topics(limit: Limit = 20) -> Any:
         return await read("list_topics", {"limit": limit})
+
+    @server.tool(
+        description=(
+            "List configured conference discovery sources and whether each source is enabled. "
+            "Use this for questions about source URLs or source monitoring."
+        ),
+        annotations=read_only,
+    )
+    async def list_sources(limit: Limit = 20) -> Any:
+        return await read("list_sources", {"limit": limit})
 
     @server.tool(
         description=(
@@ -130,6 +144,16 @@ def build_mcp_server(services: MCPToolServices) -> MCPServer:
         return await read(
             "search_conference_candidates", {"query": query, "limit": limit, "page": page}
         )
+
+    @server.tool(
+        description=(
+            "List the owner's active conference candidates waiting for review. "
+            "Use this when the owner asks which candidates are pending or awaiting review."
+        ),
+        annotations=read_only,
+    )
+    async def list_pending_candidates(limit: Limit = 20) -> Any:
+        return await read("list_pending_candidates", {"limit": limit})
 
     @server.tool(
         description="Inspect one event candidate through the safe verification pipeline.",
@@ -250,10 +274,34 @@ def build_mcp_server(services: MCPToolServices) -> MCPServer:
         )
 
     @server.tool(
+        description="Propose deleting one owner topic after confirmation.",
+        annotations=proposal,
+    )
+    async def propose_delete_topic(topic_id: PositiveId) -> dict[str, Any]:
+        topic = await services.internal_read("get_topic", {"topic_id": topic_id})
+        if topic is None or not str(topic.get("name", "")).strip():
+            raise ToolError("topic not found")
+        return await propose(
+            DeleteTopicAction(topic_id=topic_id, name=str(topic["name"]).strip())
+        )
+
+    @server.tool(
         description="Propose adding a trusted source for owner confirmation.", annotations=proposal
     )
     async def propose_add_source(source_type: SourceType, value: str) -> dict[str, Any]:
         return await propose(AddSourceAction(source_type=source_type, value=value))
+
+    @server.tool(
+        description="Propose deleting one configured source after owner confirmation.",
+        annotations=proposal,
+    )
+    async def propose_delete_source(source_id: PositiveId) -> dict[str, Any]:
+        source = await services.internal_read("get_source", {"source_id": source_id})
+        if source is None or not str(source.get("name", "")).strip():
+            raise ToolError("source not found")
+        return await propose(
+            DeleteSourceAction(source_id=source_id, name=str(source["name"]).strip())
+        )
 
     @server.tool(
         description=(
@@ -279,6 +327,26 @@ def build_mcp_server(services: MCPToolServices) -> MCPServer:
         if not direct_match and not graph_match:
             raise ValueError("conference not found")
         return await propose(TrackConferenceAction(conference_id=conference_id))
+
+    @server.tool(
+        description=(
+            "Propose removing one conference from the owner's lists after confirmation. "
+            "Shared conference data used by other owners is preserved."
+        ),
+        annotations=proposal,
+    )
+    async def propose_delete_conference(conference_id: PositiveId) -> dict[str, Any]:
+        conference = await services.internal_read(
+            "get_conference", {"conference_id": conference_id}
+        )
+        if conference is None or not str(conference.get("name", "")).strip():
+            raise ToolError("conference not found")
+        return await propose(
+            DeleteConferenceAction(
+                conference_id=conference_id,
+                name=str(conference["name"]).strip(),
+            )
+        )
 
     @server.tool(
         description=(

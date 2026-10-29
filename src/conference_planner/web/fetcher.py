@@ -5,6 +5,12 @@ from urllib.parse import urljoin
 
 import httpx
 
+from conference_planner.web.access import (
+    AccessStatus,
+    EvidenceOrigin,
+    PageDiagnostics,
+    looks_like_access_challenge,
+)
 from conference_planner.web.url_safety import URLSafetyPolicy
 
 
@@ -15,9 +21,15 @@ class FetchError(RuntimeError):
         *,
         code: str | None = None,
         user_message: str | None = None,
+        url: str | None = None,
+        http_status: int | None = None,
+        retry_after: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code or type(self).__name__
+        self.url = url
+        self.http_status = http_status
+        self.retry_after = retry_after
         self.user_message = user_message or "Сайт не ответил корректной HTML-страницей."
 
 
@@ -30,6 +42,7 @@ class FetchedPage:
     last_modified: str | None = None
     content_hash: str = ""
     not_modified: bool = False
+    diagnostics: PageDiagnostics | None = None
 
 
 def normalized_content_hash(html: str) -> str:
@@ -79,6 +92,7 @@ class PageFetcher:
                             etag=response.headers.get("etag", etag),
                             last_modified=response.headers.get("last-modified", last_modified),
                             not_modified=True,
+                            diagnostics=PageDiagnostics(current, AccessStatus.NOT_MODIFIED, EvidenceOrigin.VALIDATED_CACHE, 304),
                         )
                     if response.is_redirect:
                         location = response.headers.get("location")
@@ -90,6 +104,19 @@ class PageFetcher:
                             )
                         current = await self.safety.validate(urljoin(current, location))
                         continue
+                    if response.status_code in (403, 429):
+                        raise FetchError(
+                            f"access restricted (HTTP {response.status_code})",
+                            code="ACCESS_DENIED" if response.status_code == 403 else "RATE_LIMITED",
+                            user_message=(
+                                "Сайт ограничил автоматический доступ (HTTP 403)."
+                                if response.status_code == 403 else
+                                "Сайт ограничил частоту обращений (HTTP 429)."
+                            ),
+                            url=current,
+                            http_status=response.status_code,
+                            retry_after=response.headers.get("retry-after"),
+                        )
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").lower()
                     if (
@@ -112,6 +139,14 @@ class PageFetcher:
                             )
                     encoding = response.encoding or "utf-8"
                     html = bytes(body).decode(encoding, errors="replace")
+                    if looks_like_access_challenge(html):
+                        raise FetchError(
+                            "human verification challenge detected",
+                            code="CAPTCHA_REQUIRED",
+                            user_message="Сайт требует проверки человека (CAPTCHA).",
+                            url=current,
+                            http_status=response.status_code,
+                        )
                     return FetchedPage(
                         current,
                         html,
@@ -119,6 +154,7 @@ class PageFetcher:
                         etag=response.headers.get("etag"),
                         last_modified=response.headers.get("last-modified"),
                         content_hash=normalized_content_hash(html),
+                        diagnostics=PageDiagnostics(current, AccessStatus.AVAILABLE, EvidenceOrigin.LIVE_PAGE, response.status_code),
                     )
             raise FetchError(
                 "too many redirects",
@@ -131,16 +167,20 @@ class PageFetcher:
                 "page returned an HTTP error",
                 code=f"HTTP_{status}",
                 user_message=f"Сайт вернул HTTP {status}.",
+                url=str(exc.request.url),
+                http_status=status,
             ) from exc
         except httpx.TimeoutException as exc:
             raise FetchError(
                 "page request timed out",
                 code="TIMEOUT",
                 user_message="Сайт не ответил за отведённое время.",
+                url=str(exc.request.url),
             ) from exc
         except httpx.RequestError as exc:
             raise FetchError(
                 "page request failed",
                 code="NETWORK_ERROR",
                 user_message="Не удалось установить соединение с сайтом.",
+                url=str(exc.request.url),
             ) from exc

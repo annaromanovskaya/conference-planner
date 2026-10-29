@@ -293,7 +293,11 @@ class KnowledgeGraphService:
             select(ConferenceTopic.conference_id)
             .join(Conference, Conference.id == ConferenceTopic.conference_id)
             .join(Topic, Topic.id == ConferenceTopic.topic_id)
-            .where(Topic.user_id == user_id, Conference.is_test.is_(False))
+            .where(
+                Topic.user_id == user_id,
+                Conference.is_test.is_(False),
+                Conference.is_catalog_source.is_(False),
+            )
         )
         by_subscription = (
             select(Subscription.conference_id)
@@ -301,6 +305,7 @@ class KnowledgeGraphService:
             .where(
                 Subscription.user_id == user_id,
                 Conference.is_test.is_(False),
+                Conference.is_catalog_source.is_(False),
             )
         )
         return set(await self.session.scalars(union(by_topic, by_subscription)))

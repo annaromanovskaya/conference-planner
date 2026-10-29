@@ -1,6 +1,6 @@
 from datetime import UTC, date, datetime
 
-from sqlalchemy import or_, select, union
+from sqlalchemy import delete, or_, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conference_planner.conferences.deduplication import (
@@ -16,7 +16,6 @@ from conference_planner.db.models import (
     DeadlineHistory,
     Subscription,
     Topic,
-    TrustedSource,
 )
 from conference_planner.schemas.common import ConferenceStatus
 
@@ -32,6 +31,7 @@ class ConferenceRepository:
                 .where(
                     Conference.status == status,
                     Conference.is_test.is_(False),
+                    Conference.is_catalog_source.is_(False),
                 )
                 .order_by(Conference.start_date)
             )
@@ -102,21 +102,12 @@ class ConferenceRepository:
                     .where(
                         Subscription.user_id == user_id,
                         Subscription.status == status,
+                        Conference.is_test.is_(False),
+                        Conference.is_catalog_source.is_(False),
                     )
                     .order_by(Conference.start_date)
                 )
             )
-            if status == ConferenceStatus.ARCHIVED:
-                source_urls = {
-                    canonical_url(value)
-                    for value in await self.session.scalars(select(TrustedSource.url))
-                }
-                conferences = [
-                    conference
-                    for conference in conferences
-                    if canonical_url(conference.website) not in source_urls
-                    and canonical_url(conference.source_url) not in source_urls
-                ]
             return conferences
         ids = await self.accessible_ids(user_id)
         if not ids:
@@ -129,6 +120,8 @@ class ConferenceRepository:
                     Conference.id.in_(ids),
                     Conference.status == status,
                     Conference.id.not_in(subscribed),
+                    Conference.is_test.is_(False),
+                    Conference.is_catalog_source.is_(False),
                 )
                 .order_by(Conference.start_date)
             )
@@ -137,10 +130,23 @@ class ConferenceRepository:
     async def accessible_ids(self, user_id: int) -> set[int]:
         by_topic = (
             select(ConferenceTopic.conference_id)
+            .join(Conference, Conference.id == ConferenceTopic.conference_id)
             .join(Topic, Topic.id == ConferenceTopic.topic_id)
-            .where(Topic.user_id == user_id)
+            .where(
+                Topic.user_id == user_id,
+                Conference.is_test.is_(False),
+                Conference.is_catalog_source.is_(False),
+            )
         )
-        by_subscription = select(Subscription.conference_id).where(Subscription.user_id == user_id)
+        by_subscription = (
+            select(Subscription.conference_id)
+            .join(Conference, Conference.id == Subscription.conference_id)
+            .where(
+                Subscription.user_id == user_id,
+                Conference.is_test.is_(False),
+                Conference.is_catalog_source.is_(False),
+            )
+        )
         return set(await self.session.scalars(union(by_topic, by_subscription)))
 
     async def require_accessible(self, user_id: int, conference_id: int) -> Conference:
@@ -184,6 +190,28 @@ class ConferenceRepository:
         subscription.status = ConferenceStatus.ARCHIVED
         await self.session.flush()
         return subscription
+
+    async def remove_for_user(self, user_id: int, conference_id: int) -> str | None:
+        if conference_id not in await self.accessible_ids(user_id):
+            return None
+        conference = await self.session.get(Conference, conference_id)
+        if conference is None:
+            return None
+        await self.session.execute(
+            delete(Subscription).where(
+                Subscription.user_id == user_id,
+                Subscription.conference_id == conference_id,
+            )
+        )
+        owner_topics = select(Topic.id).where(Topic.user_id == user_id)
+        await self.session.execute(
+            delete(ConferenceTopic).where(
+                ConferenceTopic.conference_id == conference_id,
+                ConferenceTopic.topic_id.in_(owner_topics),
+            )
+        )
+        await self.session.flush()
+        return conference.name
 
     async def update_deadline(
         self,

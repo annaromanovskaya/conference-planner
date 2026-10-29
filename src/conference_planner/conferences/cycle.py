@@ -26,6 +26,12 @@ from conference_planner.schemas.workflows import WorkflowBudget
 from conference_planner.workflows.engine import ProgressSink, TaskArtifact, WorkflowEngine
 from conference_planner.workflows.planner import WorkflowPlanner
 
+_LEGACY_SEARCH_ERROR_CODES = {"SearchProviderError"}
+
+
+def _is_search_error(error: str) -> bool:
+    return error.startswith("SEARCH_") or error in _LEGACY_SEARCH_ERROR_CODES
+
 
 class CycleMode(StrEnum):
     MANUAL = "MANUAL"
@@ -58,6 +64,10 @@ class ConferenceCycleReport(BaseModel):
     new_candidate_ids: tuple[int, ...] = ()
     duplicates: int = 0
     pages_checked: int = 0
+    search_attempts: int = 0
+    unresponsive_engines: tuple[str, ...] = ()
+    monitoring_errors: tuple[str, ...] = ()
+    search_errors: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
 
 
@@ -148,6 +158,19 @@ class ConferenceCycleService:
             ),
             {},
         )
+        errors = tuple(result.get("errors", ()))
+        search_errors = tuple(
+            result.get(
+                "search_errors",
+                (error for error in errors if _is_search_error(error)),
+            )
+        )
+        monitoring_errors = tuple(
+            result.get(
+                "monitoring_errors",
+                (error for error in errors if not _is_search_error(error)),
+            )
+        )
         return ConferenceCycleReport(
             run_id=run.id,
             status=run.status,
@@ -157,7 +180,11 @@ class ConferenceCycleService:
             new_candidate_ids=tuple(result.get("new_candidate_ids", ())),
             duplicates=result.get("duplicates", 0),
             pages_checked=result.get("pages_checked", 0),
-            errors=tuple(result.get("errors", ())),
+            search_attempts=result.get("search_attempts", 0),
+            unresponsive_engines=tuple(result.get("unresponsive_engines", ())),
+            monitoring_errors=monitoring_errors,
+            search_errors=search_errors,
+            errors=errors,
         )
 
     def _handlers(self, cycle: _CycleContext):
@@ -168,10 +195,12 @@ class ConferenceCycleService:
                     force=cycle.request.mode == CycleMode.MANUAL,
                 )
             except Exception:
+                monitoring_errors = ["TRACKED_CHECK_FAILED"]
                 payload = {
                     "checked_tracked": 0,
                     "updated_tracked": 0,
-                    "errors": ["TRACKED_CHECK_FAILED"],
+                    "monitoring_errors": monitoring_errors,
+                    "errors": monitoring_errors,
                 }
             else:
                 groups = (
@@ -182,15 +211,17 @@ class ConferenceCycleService:
                     report.errors,
                     report.catalogs,
                 )
+                monitoring_errors = [
+                    getattr(item, "error_code", "TRACKED_CHECK_FAILED")
+                    for item in report.errors
+                ]
                 payload = {
                     "checked_tracked": sum(len(group) for group in groups),
                     "updated_tracked": len(report.created)
                     + len(report.changed)
                     + len(report.catalogs),
-                    "errors": [
-                        getattr(item, "error_code", "TRACKED_CHECK_FAILED")
-                        for item in report.errors
-                    ],
+                    "monitoring_errors": monitoring_errors,
+                    "errors": monitoring_errors,
                 }
             return TaskArtifact(
                 artifact_kind="tracked_conference_check",
@@ -228,13 +259,14 @@ class ConferenceCycleService:
                 except (CandidateExpiredError, CandidateUnusableError):
                     continue
                 except Exception as exc:
-                    errors.append(type(exc).__name__)
+                    errors.append(f"SEARCH_FAILED:{type(exc).__name__}")
                     continue
                 reactivated += int(changed)
             return TaskArtifact(
                 artifact_kind="candidate_decision_check",
                 payload={
                     "reactivated_candidates": reactivated,
+                    "monitoring_errors": errors,
                     "errors": errors,
                 },
                 validation_state=ArtifactValidationState.ACCEPTED,
@@ -244,6 +276,8 @@ class ConferenceCycleService:
             new_candidate_ids: list[int] = []
             duplicates = 0
             pages_checked = 0
+            search_attempts = 0
+            unresponsive_engines: list[str] = []
             errors: list[str] = []
             for query in cycle.queries:
                 try:
@@ -261,10 +295,19 @@ class ConferenceCycleService:
                         new_candidate_ids.append(candidate_id)
                 duplicates += report.duplicates
                 pages_checked += report.pages_checked
+                search_attempts += report.search_attempts
+                if report.error_code is not None:
+                    errors.append(report.error_code)
+                for diagnostic in report.unresponsive_engines:
+                    if diagnostic not in unresponsive_engines:
+                        unresponsive_engines.append(diagnostic)
             payload = {
                 "new_candidate_ids": new_candidate_ids,
                 "duplicates": duplicates,
                 "pages_checked": pages_checked,
+                "search_attempts": search_attempts,
+                "unresponsive_engines": unresponsive_engines,
+                "search_errors": errors,
                 "errors": errors,
             }
             return TaskArtifact(
@@ -274,7 +317,20 @@ class ConferenceCycleService:
             )
 
         async def synthesize(task_context) -> TaskArtifact:
-            payloads = [item.payload for item in task_context.dependencies.values()]
+            dependencies = list(task_context.dependencies.values())
+            payloads = [item.payload for item in dependencies]
+            monitoring_errors: list[str] = []
+            search_errors: list[str] = []
+            for item in dependencies:
+                item_errors = list(item.payload.get("errors", []))
+                if "monitoring_errors" in item.payload:
+                    monitoring_errors.extend(item.payload["monitoring_errors"])
+                elif item.artifact_kind != "fresh_candidate_search":
+                    monitoring_errors.extend(item_errors)
+                if "search_errors" in item.payload:
+                    search_errors.extend(item.payload["search_errors"])
+                elif item.artifact_kind == "fresh_candidate_search":
+                    search_errors.extend(item_errors)
             payload = {
                 "checked_tracked": sum(
                     item.get("checked_tracked", 0) for item in payloads
@@ -297,6 +353,18 @@ class ConferenceCycleService:
                 "pages_checked": sum(
                     item.get("pages_checked", 0) for item in payloads
                 ),
+                "search_attempts": sum(
+                    item.get("search_attempts", 0) for item in payloads
+                ),
+                "unresponsive_engines": list(
+                    dict.fromkeys(
+                        diagnostic
+                        for item in payloads
+                        for diagnostic in item.get("unresponsive_engines", [])
+                    )
+                ),
+                "monitoring_errors": monitoring_errors,
+                "search_errors": search_errors,
                 "errors": [
                     error for item in payloads for error in item.get("errors", [])
                 ],

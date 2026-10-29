@@ -6,6 +6,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+from conference_planner.ai.gateway import ModelGatewayError
+from conference_planner.ai.service import AIResponseError
 from conference_planner.bot.access import OwnerOnlyMiddleware
 from conference_planner.bot.agent_router import build_agent_router, handle_search_query
 from conference_planner.bot.conference_router import build_conference_router
@@ -13,9 +15,10 @@ from conference_planner.bot.confirmation_router import build_confirmation_router
 from conference_planner.bot.errors import ExternalErrorMiddleware
 from conference_planner.bot.keyboards import (
     action_confirmation,
-    add_buttons,
     main_menu,
+    source_management,
     topic_confirmation,
+    topic_management,
 )
 from conference_planner.bot.model_router import build_model_router
 from conference_planner.bot.states import SearchFlow, SourceFlow, TopicFlow
@@ -23,6 +26,7 @@ from conference_planner.bot.test_reminder_router import build_test_reminder_rout
 from conference_planner.bot.usage_router import build_usage_router
 from conference_planner.db.repositories.sources import source_display_name
 from conference_planner.schemas.common import SourceType
+from conference_planner.schemas.topics import TopicNormalization
 
 MAIN_MENU_BUTTONS = frozenset(
     {
@@ -44,6 +48,18 @@ NEXT_CANDIDATE_TEXTS = frozenset(
         "давай дальше",
     }
 )
+
+
+async def normalize_topic_or_fallback(ai_service, raw_text: str) -> TopicNormalization:
+    try:
+        return await ai_service.normalize_topic(raw_text)
+    except (AIResponseError, ModelGatewayError):
+        cleaned = raw_text.strip()
+        return TopicNormalization(
+            name=cleaned[:200],
+            description=cleaned[:2_000],
+            keywords=[cleaned[:200]],
+        )
 
 
 def build_router(*, owner_telegram_id: int) -> Router:
@@ -71,7 +87,7 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await open_menu(state)
         values = await topic_repository.list_for_user(topic_repository.owner_user_id)
         text = "\n".join(f"⭐ {escape(item.name)}" for item in values) or "Тем пока нет."
-        await message.answer(text, reply_markup=add_buttons("topic"), parse_mode="HTML")
+        await message.answer(text, reply_markup=topic_management(values), parse_mode="HTML")
 
     @router.message(F.text == "Найти конференции")
     async def find_conferences(message: Message, state: FSMContext) -> None:
@@ -103,9 +119,33 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await callback.message.answer("Опишите научную тематику свободным текстом.")
         await callback.answer()
 
+    @router.callback_query(F.data.startswith("topic:delete:"))
+    async def topic_delete(
+        callback: CallbackQuery,
+        confirmation_service,
+        topic_repository,
+        owner_user_id: int,
+    ) -> None:
+        from conference_planner.schemas.agent import DeleteTopicAction
+
+        topic_id = int(callback.data.rsplit(":", 1)[1])
+        topic = await topic_repository.get_for_user(owner_user_id, topic_id)
+        if topic is None:
+            await callback.answer("Тема не найдена.", show_alert=True)
+            return
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            DeleteTopicAction(topic_id=topic.id, name=topic.name),
+        )
+        await callback.message.answer(
+            pending.summary,
+            reply_markup=action_confirmation(pending.id),
+        )
+        await callback.answer()
+
     @router.message(TopicFlow.waiting_text, F.text.func(is_flow_text))
     async def topic_preview(message: Message, state: FSMContext, ai_service) -> None:
-        value = await ai_service.normalize_topic(message.text or "")
+        value = await normalize_topic_or_fallback(ai_service, message.text or "")
         await state.update_data(topic=value.model_dump(mode="json"))
         await state.set_state(TopicFlow.waiting_confirmation)
         keywords = "\n".join(f"• {escape(item)}" for item in value.keywords)
@@ -160,7 +200,7 @@ def build_router(*, owner_telegram_id: int) -> Router:
             )
             or "Источников пока нет."
         )
-        await message.answer(text, reply_markup=add_buttons("source"), parse_mode="HTML")
+        await message.answer(text, reply_markup=source_management(values), parse_mode="HTML")
 
     @router.callback_query(F.data.startswith("source:toggle:"))
     async def source_toggle(callback: CallbackQuery, source_repository) -> None:
@@ -170,10 +210,30 @@ def build_router(*, owner_telegram_id: int) -> Router:
         await callback.answer("Источник обновлён")
 
     @router.callback_query(F.data.startswith("source:delete:"))
-    async def source_delete(callback: CallbackQuery, source_repository) -> None:
-        await source_repository.delete(int(callback.data.rsplit(":", 1)[1]))
-        await source_repository.session.commit()
-        await callback.answer("Источник удалён")
+    async def source_delete(
+        callback: CallbackQuery,
+        confirmation_service,
+        source_repository,
+        owner_user_id: int,
+    ) -> None:
+        from conference_planner.schemas.agent import DeleteSourceAction
+
+        source = await source_repository.get(int(callback.data.rsplit(":", 1)[1]))
+        if source is None:
+            await callback.answer("Источник уже удалён.", show_alert=True)
+            return
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            DeleteSourceAction(
+                source_id=source.id,
+                name=source_display_name(source),
+            ),
+        )
+        await callback.message.answer(
+            pending.summary,
+            reply_markup=action_confirmation(pending.id),
+        )
+        await callback.answer()
 
     @router.callback_query(F.data == "source:add")
     async def source_add(callback: CallbackQuery, state: FSMContext) -> None:
@@ -226,6 +286,36 @@ def build_router(*, owner_telegram_id: int) -> Router:
             ArchiveConferenceAction(conference_id=int(callback.data.rsplit(":", 1)[1])),
         )
         await callback.message.answer(pending.summary, reply_markup=action_confirmation(pending.id))
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("conference:delete:"))
+    async def delete_conference(
+        callback: CallbackQuery,
+        confirmation_service,
+        conference_repository,
+        owner_user_id: int,
+    ) -> None:
+        from conference_planner.schemas.agent import DeleteConferenceAction
+
+        conference_id = int(callback.data.rsplit(":", 1)[1])
+        try:
+            conference = await conference_repository.require_accessible(
+                owner_user_id, conference_id
+            )
+        except ValueError:
+            await callback.answer("Конференция уже удалена или недоступна.", show_alert=True)
+            return
+        pending = await confirmation_service.propose(
+            owner_user_id,
+            DeleteConferenceAction(
+                conference_id=conference.id,
+                name=conference.name,
+            ),
+        )
+        await callback.message.answer(
+            pending.summary,
+            reply_markup=action_confirmation(pending.id),
+        )
         await callback.answer()
 
     router.include_router(build_conference_router())

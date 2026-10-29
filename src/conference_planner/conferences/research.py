@@ -1,3 +1,4 @@
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from urllib.parse import urlsplit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from conference_planner.ai.gateway import ModelGatewayError
+from conference_planner.ai.service import AIResponseError
 from conference_planner.conferences.candidate_policy import (
     TopicRelevanceContext,
     evaluate_keyword_relevance,
@@ -25,7 +28,11 @@ from conference_planner.conferences.persistence import (
     PersistenceReceipt,
 )
 from conference_planner.conferences.roles import ResearchRole, VerifierRole
-from conference_planner.conferences.temporal import enrich_catalog_events
+from conference_planner.conferences.temporal import (
+    enrich_catalog_events,
+    extract_temporal_research,
+    merge_temporal_research,
+)
 from conference_planner.db.models import EventCandidate
 from conference_planner.db.repositories.conference_research import (
     CandidateDraft,
@@ -44,11 +51,12 @@ from conference_planner.schemas.common import (
 from conference_planner.schemas.research import (
     ConferenceCatalogResearch,
     ConferenceResearch,
+    DeadlineClaim,
     FactClaim,
     VerifiedConferenceResearch,
 )
 from conference_planner.schemas.topics import RelevanceAssessment
-from conference_planner.search.provider import SearchProvider
+from conference_planner.search.provider import SearchPage, SearchProvider
 from conference_planner.web.fetcher import FetchedPage, FetchError, normalized_content_hash
 from conference_planner.web.parser import PageLink, extract_page_links, extract_page_text
 
@@ -86,6 +94,9 @@ class CandidateSearchReport:
     pages_checked: int
     duplicates: int
     exhausted: bool
+    search_attempts: int = 0
+    error_code: str | None = None
+    unresponsive_engines: tuple[str, ...] = ()
 
 
 class Fetcher(Protocol):
@@ -111,9 +122,30 @@ class ResearchAnalyzer(Protocol):
         topics: tuple[TopicRelevanceContext, ...],
     ) -> RelevanceAssessment: ...
 
+    async def select_research_links(
+        self,
+        expected_name: str,
+        page_url: str,
+        links: tuple[PageLink, ...],
+    ) -> tuple[str, ...]: ...
+
 
 class ConferenceResearchService:
     MAX_PAGE_RESULTS = 50
+    _ENGLISH_QUERY_TERMS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("астрохим", "astrochemistry"),
+        ("звездообраз", "star formation"),
+        ("молекулярн", "molecular spectroscopy"),
+        ("межзвезд", "interstellar medium"),
+        ("межзвёзд", "interstellar medium"),
+        ("радиоинтерфер", "radio interferometry"),
+        ("машинн", "machine learning"),
+        ("спектроскоп", "spectroscopy"),
+        ("астроном", "astronomy"),
+        ("европ", "Europe"),
+        ("росси", "Russia"),
+        ("ази", "Asia"),
+    )
 
     def __init__(
         self,
@@ -144,20 +176,24 @@ class ConferenceResearchService:
         self.last_search_new_ids: tuple[int, ...] = ()
         self.last_search_result_count = 0
         self.last_search_duplicate_count = 0
+        self.last_search_unresponsive_engines: tuple[str, ...] = ()
 
     async def search(
-        self, user_id: int, query: str, limit: int = 10, *, page: int = 1
+        self,
+        user_id: int,
+        query: str,
+        limit: int = 10,
+        *,
+        page: int = 1,
+        search_query: str | None = None,
     ) -> list[EventCandidate]:
         bounded_limit = max(1, min(limit, self.MAX_PAGE_RESULTS))
         topics = await self._topic_contexts(user_id)
-        search_query = query
-        if self.application_clock is not None:
-            search_query = (
-                f"{query}. Текущая дата: {self.application_clock.today().isoformat()}. "
-                "Искать только ещё не завершившиеся научные мероприятия."
-            )
-        raw_results = (await self.search_provider.search(search_query, page=page))[:bounded_limit]
+        effective_query = search_query or self._dated_search_query(query)
+        search_page = await self._search_page(effective_query, page=page)
+        raw_results = list(search_page.results[:bounded_limit])
         self.last_search_result_count = len(raw_results)
+        self.last_search_unresponsive_engines = search_page.unresponsive_engines
         drafts: list[CandidateDraft] = []
         seen_identities: set[tuple[str, str]] = set()
         for position, result in enumerate(raw_results):
@@ -231,15 +267,21 @@ class ConferenceResearchService:
         duplicates = 0
         exhausted = False
         pages_checked = 0
+        diagnostics: list[str] = []
 
-        for page in range(1, bounded_pages + 1):
+        async def attempt(page: int, search_query: str | None = None) -> None:
+            nonlocal duplicates, pages_checked
             candidates = await self.search(
                 user_id,
                 query,
                 limit=bounded_results,
                 page=page,
+                search_query=search_query,
             )
             pages_checked += 1
+            for diagnostic in self.last_search_unresponsive_engines:
+                if diagnostic not in diagnostics:
+                    diagnostics.append(diagnostic)
             for candidate in candidates:
                 if candidate.id not in active_ids:
                     active_ids.append(candidate.id)
@@ -248,11 +290,21 @@ class ConferenceResearchService:
                     new_ids.append(candidate_id)
             duplicates += self.last_search_duplicate_count
 
-            if new_ids:
-                break
+        await attempt(1)
+        if self.last_search_result_count == 0:
+            await self._wait_before_search_retry(1.0)
+            english_query = await self._english_search_query(query)
+            await attempt(1, english_query)
             if self.last_search_result_count == 0:
-                exhausted = True
-                break
+                await self._wait_before_search_retry(2.0)
+                await attempt(2, english_query)
+            exhausted = self.last_search_result_count == 0
+        elif not new_ids:
+            for page in range(2, bounded_pages + 1):
+                await attempt(page)
+                if new_ids or self.last_search_result_count == 0:
+                    exhausted = self.last_search_result_count == 0
+                    break
 
         return CandidateSearchReport(
             active_ids=tuple(active_ids),
@@ -260,7 +312,71 @@ class ConferenceResearchService:
             pages_checked=pages_checked,
             duplicates=duplicates,
             exhausted=exhausted,
+            search_attempts=pages_checked,
+            error_code=(
+                "SEARCH_UNAVAILABLE"
+                if exhausted and diagnostics
+                else "SEARCH_EMPTY" if exhausted else None
+            ),
+            unresponsive_engines=tuple(diagnostics),
         )
+
+    async def _wait_before_search_retry(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+    async def _search_page(self, query: str, *, page: int) -> SearchPage:
+        search_page = getattr(self.search_provider, "search_page", None)
+        if callable(search_page):
+            return await search_page(query, page=page)
+        results = await self.search_provider.search(query, page=page)
+        return SearchPage(tuple(results))
+
+    def _dated_search_query(self, query: str, *, english: bool = False) -> str:
+        if self.application_clock is None:
+            return query
+        current_date = self.application_clock.today().isoformat()
+        if english:
+            return (
+                f"{query}. Current date: {current_date}. "
+                "Only upcoming scientific events."
+            )
+        return (
+            f"{query}. Текущая дата: {current_date}. "
+            "Искать только ещё не завершившиеся научные мероприятия."
+        )
+
+    async def _english_search_query(self, query: str) -> str:
+        translator = getattr(self.ai, "translate_search_query", None)
+        try:
+            translated = await translator(query) if callable(translator) else ""
+        except Exception:
+            translated = ""
+        if (
+            not isinstance(translated, str)
+            or not translated.strip()
+            or re.search(r"[А-Яа-яЁё]", translated)
+        ):
+            translated = self._fallback_english_search_query(query)
+        return self._dated_search_query(translated.strip(), english=True)
+
+    def _fallback_english_search_query(self, query: str) -> str:
+        normalized = query.casefold()
+        terms = [
+            english
+            for fragment, english in self._ENGLISH_QUERY_TERMS
+            if fragment in normalized
+        ]
+        terms.extend(re.findall(r"\b20\d{2}\b", query))
+        if not any(term in {"astronomy", "astrochemistry"} for term in terms):
+            terms.append("astronomy")
+        terms.extend(
+            (
+                "scientific conference",
+                "official website",
+                "abstract submission deadline",
+            )
+        )
+        return " ".join(dict.fromkeys(terms))
 
     async def inspect(
         self,
@@ -281,8 +397,24 @@ class ConferenceResearchService:
         candidate = await self._require_active(user_id, candidate_id)
         await self._report(progress, f"Открываю сайт: {candidate.source_url}")
         page, page_text, page_links = await self._fetch_candidate_page(candidate)
+        primary_documents = (EvidenceDocument(page.url, page_text),)
+        deterministic = self._deterministic_research(candidate.title, primary_documents)
+        dedicated_page = self._is_dedicated_event_page(
+            candidate.title,
+            page_text,
+            deterministic,
+        )
         catalog_text = self._candidate_evidence_text(candidate, page_text)
-        catalog = await self._extract_catalog(page.url, catalog_text)
+        catalog = (
+            None
+            if dedicated_page
+            else await self._extract_catalog(page.url, catalog_text)
+        )
+        if dedicated_page:
+            await self._report(
+                progress,
+                "Обычный парсер распознал отдельную страницу конференции.",
+            )
         if catalog is not None:
             catalog = enrich_catalog_events(catalog, page.url, page_text, page_links)
             catalog = self._downgrade_catalog_snippet_evidence(catalog, candidate.summary)
@@ -539,7 +671,13 @@ class ConferenceResearchService:
     ) -> VerifiedConferenceResearch:
         if page is None or page_text is None or page_links is None:
             page, page_text, page_links = await self._fetch_candidate_page(candidate)
-        if catalog is None:
+        preview = await self.repository.load_candidate_snapshot(
+            candidate.user_id,
+            candidate.id,
+        )
+        if catalog is None and (
+            self._is_generic_title(candidate.title) or preview is not None
+        ):
             catalog = await self._extract_catalog(
                 page.url,
                 self._candidate_evidence_text(candidate, page_text),
@@ -554,10 +692,16 @@ class ConferenceResearchService:
             page_links,
             progress=progress,
         )
-        await self._report(progress, "Модель извлекает сведения о конференции.")
         text = self._candidate_evidence_text(
             candidate,
             self._documents_text(documents),
+        )
+        deterministic = self._deterministic_research(candidate.title, documents)
+        await self._report(
+            progress,
+            "Обычный парсер: "
+            f"найдено дат {len(deterministic.facts)}, "
+            f"дедлайнов {len(deterministic.deadlines)}.",
         )
         if catalog is not None and catalog.events:
             extracted, score = self._best_catalog_event(candidate.title, catalog.events)
@@ -565,30 +709,78 @@ class ConferenceResearchService:
                 len(catalog.events) > 1 and score < 0.45
             ):
                 raise CandidateUnusableError("catalog candidate must be inspected first")
-            if len(documents) > 1:
-                detailed = await self.ai.extract_conference_research(
-                    page.url, text, candidate.title
-                )
-                extracted = self._merge_research(extracted, detailed)
+            extracted = merge_temporal_research(extracted, deterministic)
+            if len(documents) > 1 and not self._deterministic_is_sufficient(
+                deterministic, documents
+            ):
+                await self._report(progress, "Модель разбирает нестандартную страницу.")
+                try:
+                    detailed = await self.ai.extract_conference_research(
+                        page.url, text, candidate.title
+                    )
+                except (AIResponseError, ModelGatewayError):
+                    if not self._is_usable_event(extracted):
+                        raise
+                    fetch_notes = (
+                        *fetch_notes,
+                        "Модельный разбор недоступен; сохранены данные обычного парсера.",
+                    )
+                else:
+                    extracted = self._merge_research(extracted, detailed)
+                    extracted = merge_temporal_research(extracted, deterministic)
+        elif self._deterministic_is_sufficient(deterministic, documents):
+            extracted = self._as_secondary_research(deterministic)
         else:
-            extracted = await ResearchRole(self.ai).extract(
-                (EvidenceDocument(page.url, text),), candidate.title
+            await self._report(progress, "Модель разбирает нестандартную страницу.")
+            try:
+                model_research = await ResearchRole(self.ai).extract(
+                    (EvidenceDocument(page.url, text),), candidate.title
+                )
+            except (AIResponseError, ModelGatewayError):
+                if not self._is_usable_event(deterministic):
+                    raise
+                extracted = deterministic
+                fetch_notes = (
+                    *fetch_notes,
+                    "Модельный разбор недоступен; сохранены данные обычного парсера.",
+                )
+            else:
+                extracted = merge_temporal_research(model_research, deterministic)
+        researcher_model = self._last_model_label()
+        if researcher_model is not None:
+            await self._report(
+                progress,
+                f"Модель исследователя: {researcher_model}.",
             )
         extracted = self._attribute_claim_sources(extracted, documents)
         validator = EvidenceValidator()
+        deterministic_identities = {
+            self._claim_identity(claim)
+            for claim in (*deterministic.facts, *deterministic.deadlines)
+        }
         needs_verification = any(
             verification_required(claim, validator.context_for(claim, documents))
             for claim in (*extracted.facts, *extracted.deadlines)
+            if self._claim_identity(claim) not in deterministic_identities
         )
         if needs_verification:
             verified = await VerifierRole(self.ai).verify(extracted, documents)
+            verifier_model = self._last_model_label(verifier=True)
+            if verifier_model is not None:
+                await self._report(
+                    progress,
+                    f"Модель проверяющего: {verifier_model}.",
+                )
         else:
             verified = VerifiedConferenceResearch.model_validate(
                 extracted.model_dump(mode="python")
             )
         verified = self._recover_visible_event_dates(
             verified,
-            text,
+            self._event_specific_text(
+                candidate.title,
+                self._fetched_page_only(documents[0].text),
+            ),
             candidate.title,
             page.url,
         )
@@ -690,11 +882,21 @@ class ConferenceResearchService:
         documents = [EvidenceDocument(page.url, primary_text)]
         notes: list[str] = []
         visited = {page.url.rstrip("/")}
+        safe_links = self._safe_research_links(page.url, page_links)
+        ranked_links = self._relevant_research_links(candidate.title, page.url, page_links)
         queue = [
             (link, 1)
-            for link in self._relevant_research_links(candidate.title, page.url, page_links)
+            for link in ranked_links
+            if self._research_link_score(candidate.title, link) > 0
         ]
-        reserve: tuple[PageLink, int] | None = None
+        reserve = next(
+            (
+                (link, 1)
+                for link in safe_links
+                if self._research_link_score(candidate.title, link) <= 0
+            ),
+            None,
+        )
 
         async def fetch_link(link: PageLink, depth: int) -> tuple[PageLink, ...]:
             normalized_url = link.url.rstrip("/")
@@ -724,18 +926,220 @@ class ConferenceResearchService:
 
         while queue and len(documents) < 7:
             link, depth = queue.pop(0)
-            if self._research_link_score(candidate.title, link) <= 0:
-                reserve = reserve or (link, depth)
-                continue
             children = await fetch_link(link, depth)
             queue.extend((child, depth + 1) for child in children)
+
+        if len(documents) < 7 and not self._documents_have_usable_temporal_research(
+            candidate.title, documents
+        ):
+            selector = getattr(self.ai, "select_research_links", None)
+            if callable(selector) and safe_links:
+                await self._report(
+                    progress,
+                    "Модель выбирает связанные страницы с датами и дедлайнами.",
+                )
+                try:
+                    selected_urls = await selector(candidate.title, page.url, safe_links)
+                except (AIResponseError, ModelGatewayError):
+                    notes.append("Модель не смогла выбрать связанные страницы.")
+                else:
+                    allowed = {link.url.rstrip("/"): link for link in safe_links}
+                    page_host = urlsplit(page.url).netloc.casefold()
+                    for selected_url in selected_urls[:4]:
+                        normalized = str(selected_url).rstrip("/")
+                        selected = allowed.get(normalized)
+                        if (
+                            selected is None
+                            or urlsplit(selected.url).scheme not in {"http", "https"}
+                            or urlsplit(selected.url).netloc.casefold() != page_host
+                            or normalized in visited
+                            or len(documents) >= 7
+                        ):
+                            continue
+                        children = await fetch_link(selected, 1)
+                        queue.extend((child, 2) for child in children)
+                    while queue and len(documents) < 7:
+                        link, depth = queue.pop(0)
+                        await fetch_link(link, depth)
         if (
             reserve is not None
             and len(documents) < 7
-            and not self._documents_have_temporal_evidence(documents)
+            and not self._documents_have_usable_temporal_research(candidate.title, documents)
         ):
             await fetch_link(*reserve)
         return tuple(documents), tuple(notes)
+
+    @staticmethod
+    def _safe_research_links(
+        page_url: str,
+        links: tuple[PageLink, ...],
+    ) -> tuple[PageLink, ...]:
+        page_host = urlsplit(page_url).netloc.casefold()
+        selected: list[PageLink] = []
+        seen: set[str] = set()
+        for link in links:
+            normalized = link.url.rstrip("/")
+            parsed = urlsplit(link.url)
+            if (
+                normalized == page_url.rstrip("/")
+                or normalized in seen
+                or parsed.scheme not in {"http", "https"}
+                or parsed.netloc.casefold() != page_host
+                or parsed.path.casefold().endswith(
+                    (".pdf", ".jpg", ".jpeg", ".png", ".webp")
+                )
+            ):
+                continue
+            seen.add(normalized)
+            selected.append(link)
+            if len(selected) >= 40:
+                break
+        return tuple(selected)
+
+    @classmethod
+    def _deterministic_research(
+        cls,
+        expected_name: str,
+        documents: tuple[EvidenceDocument, ...] | list[EvidenceDocument],
+    ) -> ConferenceResearch:
+        first = documents[0]
+        first_text = cls._event_specific_text(
+            expected_name,
+            cls._fetched_page_only(first.text),
+        )
+        combined = extract_temporal_research(first.url, first_text, expected_name)
+        for document in documents[1:]:
+            current = extract_temporal_research(
+                document.url,
+                cls._fetched_page_only(document.text),
+                expected_name,
+            )
+            combined = merge_temporal_research(combined, current)
+        return combined
+
+    @staticmethod
+    def _event_specific_text(expected_name: str, text: str) -> str:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return text
+        expected = normalize_name(expected_name)
+        scored = [
+            (SequenceMatcher(None, expected, normalize_name(line)).ratio(), index)
+            for index, line in enumerate(lines)
+        ]
+        score, anchor = max(scored, default=(0.0, 0))
+        if score < 0.55:
+            return text
+        return "\n".join(lines[anchor : anchor + 30])
+
+    @classmethod
+    def _is_dedicated_event_page(
+        cls,
+        expected_name: str,
+        text: str,
+        deterministic: ConferenceResearch,
+    ) -> bool:
+        if cls._is_generic_title(expected_name) or not cls._deterministic_is_sufficient(
+            deterministic,
+            (EvidenceDocument("https://local.invalid/", text),),
+        ):
+            return False
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        expected = normalize_name(expected_name)
+        anchors = [
+            index
+            for index, line in enumerate(lines[:5])
+            if SequenceMatcher(None, expected, normalize_name(line)).ratio() >= 0.55
+        ]
+        return bool(anchors) and min(anchors) <= 2
+
+    @staticmethod
+    def _fetched_page_only(text: str) -> str:
+        if "FETCHED_PAGE_TEXT:\n" not in text:
+            return text
+        return text.rsplit("FETCHED_PAGE_TEXT:\n", maxsplit=1)[-1]
+
+    @classmethod
+    def _deterministic_is_sufficient(
+        cls,
+        research: ConferenceResearch,
+        documents: tuple[EvidenceDocument, ...] | list[EvidenceDocument] = (),
+    ) -> bool:
+        has_start = any(claim.kind == "start_date" for claim in research.facts)
+        if not has_start or not research.deadlines:
+            return False
+        claimed_lines = {
+            " ".join(claim.excerpt.casefold().split()) for claim in research.deadlines
+        }
+        for document in documents:
+            for raw_line in cls._fetched_page_only(document.text).splitlines():
+                line = " ".join(raw_line.casefold().split())
+                if not re.search(r"\b20\d{2}\b", line):
+                    continue
+                if not any(
+                    marker in line
+                    for marker in (
+                        "deadline",
+                        "registration",
+                        "submission",
+                        "abstract",
+                        "дедлайн",
+                        "регистрац",
+                        "подач",
+                        "тезис",
+                    )
+                ):
+                    continue
+                if not any(excerpt in line or line in excerpt for excerpt in claimed_lines):
+                    return False
+        return True
+
+    @staticmethod
+    def _as_secondary_research(research: ConferenceResearch) -> ConferenceResearch:
+        def convert(claim: FactClaim | DeadlineClaim):
+            status = (
+                VerificationStatus.TENTATIVE
+                if getattr(claim, "tentative", False)
+                else VerificationStatus.SECONDARY_UNVERIFIED
+            )
+            return claim.model_copy(
+                update={
+                    "source_class": EvidenceSourceClass.SECONDARY,
+                    "verification_status": status,
+                }
+            )
+
+        return research.model_copy(
+            update={
+                "source_class": EvidenceSourceClass.SECONDARY,
+                "facts": tuple(convert(claim) for claim in research.facts),
+                "deadlines": tuple(convert(claim) for claim in research.deadlines),
+            }
+        )
+
+    @staticmethod
+    def _claim_identity(claim: FactClaim | DeadlineClaim) -> tuple[object, ...]:
+        if isinstance(claim, FactClaim):
+            return "fact", claim.kind, claim.value, claim.excerpt
+        return (
+            "deadline",
+            claim.deadline_type,
+            claim.exact_date,
+            claim.approximate_year,
+            claim.approximate_month,
+            claim.excerpt,
+        )
+
+    @classmethod
+    def _documents_have_usable_temporal_research(
+        cls,
+        expected_name: str,
+        documents: list[EvidenceDocument],
+    ) -> bool:
+        return cls._deterministic_is_sufficient(
+            cls._deterministic_research(expected_name, documents),
+            documents,
+        )
 
     @staticmethod
     async def _report(
@@ -744,6 +1148,13 @@ class ConferenceResearchService:
     ) -> None:
         if progress is not None:
             await progress(text)
+
+    def _last_model_label(self, *, verifier: bool = False) -> str | None:
+        labeler = getattr(self.ai, "last_model_label", None)
+        if not callable(labeler):
+            return None
+        label = labeler(verifier=verifier)
+        return label if isinstance(label, str) and label else None
 
     @staticmethod
     def _documents_text(documents: tuple[EvidenceDocument, ...]) -> str:
@@ -811,7 +1222,8 @@ class ConferenceResearchService:
             "конференц",
         )
         label = normalize_name(link.text)
-        url_text = normalize_name(link.url)
+        parsed_url = urlsplit(link.url)
+        url_text = normalize_name(f"{parsed_url.path} {parsed_url.query}")
         score = sum(3 for marker in markers if marker in label)
         score += sum(1 for marker in markers if marker in url_text)
         if SequenceMatcher(None, normalize_name(expected_name), label).ratio() >= 0.55:

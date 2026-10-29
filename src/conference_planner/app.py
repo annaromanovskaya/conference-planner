@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select, union
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conference_planner.agent.actions import ConfirmationService
+from conference_planner.agent.actions import ActionUnavailable, ConfirmationService
 from conference_planner.agent.knowledge import KnowledgeGraphService
 from conference_planner.agent.memory import MemoryService
 from conference_planner.agent.runtime import AgentRuntime
@@ -75,6 +75,9 @@ from conference_planner.schemas.agent import (
     AddSourceAction,
     AddTopicAction,
     ArchiveConferenceAction,
+    DeleteConferenceAction,
+    DeleteSourceAction,
+    DeleteTopicAction,
     ForgetMemoryAction,
     ImportConferenceCandidateAction,
     ImportConferenceURLAction,
@@ -693,9 +696,21 @@ def _build_action_executors(
         )
         return "Тема добавлена."
 
+    async def delete_topic(user_id: int, payload: DeleteTopicAction) -> str:
+        topic_name = await TopicRepository(session).delete_for_user(user_id, payload.topic_id)
+        if topic_name is None:
+            raise ActionUnavailable("topic not found")
+        return f"Тема «{topic_name}» удалена."
+
     async def add_source(_user_id: int, payload: AddSourceAction) -> str:
         await SourceRepository(session).create(payload.value, payload.value, payload.source_type)
         return "Источник добавлен."
+
+    async def delete_source(_user_id: int, payload: DeleteSourceAction) -> str:
+        source_name = await SourceRepository(session).delete(payload.source_id)
+        if source_name is None:
+            raise ActionUnavailable("source not found")
+        return f"Источник «{source_name}» удалён."
 
     async def track(user_id: int, payload: TrackConferenceAction) -> str:
         repository = ConferenceRepository(session)
@@ -704,6 +719,14 @@ def _build_action_executors(
             raise ValueError("conference not found")
         await repository.track(user_id, payload.conference_id)
         return "Конференция отслеживается."
+
+    async def delete_conference(user_id: int, payload: DeleteConferenceAction) -> str:
+        conference_name = await ConferenceRepository(session).remove_for_user(
+            user_id, payload.conference_id
+        )
+        if conference_name is None:
+            raise ActionUnavailable("conference not found")
+        return f"Конференция «{conference_name}» удалена из ваших списков."
 
     async def import_candidate(
         user_id: int,
@@ -879,8 +902,11 @@ def _build_action_executors(
 
     return {
         "add_topic": add_topic,
+        "delete_topic": delete_topic,
         "add_source": add_source,
+        "delete_source": delete_source,
         "track_conference": track,
+        "delete_conference": delete_conference,
         "import_conference_candidate": import_candidate,
         "import_conference_url": import_candidate,
         "archive_conference": archive,
@@ -931,6 +957,45 @@ def _build_read_handlers(
 
         return await with_session(operation)
 
+    async def get_topic(user_id: int, arguments: dict) -> dict | None:
+        async def operation(session):
+            topic = await TopicRepository(session).get_for_user(user_id, arguments["topic_id"])
+            if topic is None:
+                return None
+            return {"kind": "topic", "id": topic.id, "name": topic.name}
+
+        return await with_session(operation)
+
+    async def list_sources(_user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            values = await SourceRepository(session).list_all()
+            return {
+                "items": [
+                    {
+                        "kind": "source",
+                        "id": item.id,
+                        "name": item.name,
+                        "url": item.url,
+                        "source_type": item.source_type.value,
+                        "enabled": item.enabled,
+                        "last_checked_at": item.last_checked_at,
+                    }
+                    for item in values[: arguments["limit"]]
+                ],
+                "provenance": {"source": "database"},
+            }
+
+        return await with_session(operation)
+
+    async def get_source(_user_id: int, arguments: dict) -> dict | None:
+        async def operation(session):
+            source = await SourceRepository(session).get(arguments["source_id"])
+            if source is None:
+                return None
+            return {"kind": "source", "id": source.id, "name": source.name}
+
+        return await with_session(operation)
+
     async def list_conferences(user_id: int, arguments: dict) -> dict:
         async def operation(session):
             status_value = arguments.get("status")
@@ -946,6 +1011,23 @@ def _build_read_handlers(
                     _conference_mapping(item, status=status) for item in values
                 ],
                 "provenance": {"source": "database"},
+            }
+
+        return await with_session(operation)
+
+    async def get_conference(user_id: int, arguments: dict) -> dict | None:
+        async def operation(session):
+            repository = ConferenceRepository(session)
+            try:
+                conference = await repository.require_accessible(
+                    user_id, arguments["conference_id"]
+                )
+            except ValueError:
+                return None
+            return {
+                "kind": "conference",
+                "id": conference.id,
+                "name": conference.name,
             }
 
         return await with_session(operation)
@@ -1100,6 +1182,49 @@ def _build_read_handlers(
                 "title": candidate.title,
                 "url": candidate.source_url,
                 "research": research.model_dump(mode="json"),
+            }
+
+        return await with_session(operation)
+
+    async def list_pending_candidates(user_id: int, arguments: dict) -> dict:
+        async def operation(session):
+            values = await ConferenceResearchRepository(session).list_candidates(
+                user_id,
+                CandidateStatus.ACTIVE,
+                limit=arguments["limit"],
+            )
+            items = []
+            for candidate in values:
+                payload = (
+                    candidate.research_payload
+                    if isinstance(candidate.research_payload, dict)
+                    else {}
+                )
+                deadlines = payload.get("deadlines", [])
+                if not isinstance(deadlines, list):
+                    deadlines = []
+                items.append(
+                    {
+                        "kind": "event_candidate",
+                        "id": candidate.id,
+                        "title": candidate.title,
+                        "url": candidate.source_url,
+                        "official_url": candidate.official_url,
+                        "summary": candidate.summary,
+                        "verification_status": candidate.verification_status.value,
+                        "start_date": candidate.start_date,
+                        "end_date": candidate.end_date,
+                        "location": candidate.location,
+                        "deadlines": deadlines[:20],
+                        "relevance_score": candidate.topic_relevance_score,
+                        "relevance_reason": candidate.topic_relevance_reason,
+                        "researched_at": candidate.researched_at,
+                    }
+                )
+            return {
+                "items": items,
+                "count": len(items),
+                "provenance": {"source": "database", "status": "ACTIVE"},
             }
 
         return await with_session(operation)
@@ -1339,7 +1464,11 @@ def _build_read_handlers(
 
     return {
         "list_topics": list_topics,
+        "get_topic": get_topic,
+        "list_sources": list_sources,
+        "get_source": get_source,
         "list_conferences": list_conferences,
+        "get_conference": get_conference,
         "find_conferences": find_conferences,
         "get_conference_context": conference_context,
         "list_upcoming_deadlines": deadlines,
@@ -1348,6 +1477,7 @@ def _build_read_handlers(
         "list_memories": memories,
         "get_active_model": active_model,
         "search_conference_candidates": search_candidates,
+        "list_pending_candidates": list_pending_candidates,
         "get_candidate": inspect_candidate,
         "list_conference_details": conference_details,
         "check_tracked_conference": check_tracked,
@@ -1366,7 +1496,11 @@ async def _accessible_conference_ids(session: AsyncSession, user_id: int) -> set
         select(ConferenceTopic.conference_id)
         .join(Conference, Conference.id == ConferenceTopic.conference_id)
         .join(Topic, Topic.id == ConferenceTopic.topic_id)
-        .where(Topic.user_id == user_id, Conference.is_test.is_(False))
+        .where(
+            Topic.user_id == user_id,
+            Conference.is_test.is_(False),
+            Conference.is_catalog_source.is_(False),
+        )
     )
     by_subscription = (
         select(Subscription.conference_id)
@@ -1374,6 +1508,7 @@ async def _accessible_conference_ids(session: AsyncSession, user_id: int) -> set
         .where(
             Subscription.user_id == user_id,
             Conference.is_test.is_(False),
+            Conference.is_catalog_source.is_(False),
         )
     )
     return set(await session.scalars(union(by_topic, by_subscription)))
@@ -1396,14 +1531,17 @@ async def _list_accessible_conferences(
     ids = await _accessible_conference_ids(session, user_id)
     if not ids:
         return []
-    return list(
+    values = list(
         await session.scalars(
             select(Conference)
-            .where(Conference.id.in_(ids))
+            .where(
+                Conference.id.in_(ids),
+                Conference.is_catalog_source.is_(False),
+            )
             .order_by(Conference.start_date, Conference.id)
-            .limit(limit)
         )
     )
+    return values[:limit]
 
 
 async def _find_accessible_conferences(
@@ -1418,7 +1556,12 @@ async def _find_accessible_conferences(
         return []
     needle = normalize_name(query)
     values = list(
-        await session.scalars(select(Conference).where(Conference.id.in_(ids)))
+        await session.scalars(
+            select(Conference).where(
+                Conference.id.in_(ids),
+                Conference.is_catalog_source.is_(False),
+            )
+        )
     )
     matches = [
         item

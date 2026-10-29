@@ -62,6 +62,7 @@ class ReminderRepository:
                 Subscription.user_id == user_id,
                 Subscription.status == ConferenceStatus.TRACKING,
                 Conference.is_test.is_(False),
+                Conference.is_catalog_source.is_(False),
             )
         )
         return [
@@ -90,6 +91,7 @@ class ReminderRepository:
             .where(
                 Subscription.user_id == user_id,
                 Subscription.status == ConferenceStatus.TRACKING,
+                Conference.is_catalog_source.is_(False),
                 (
                     (Deadline.deadline_date >= today)
                     | (

@@ -35,6 +35,32 @@ def add_buttons(kind: str) -> InlineKeyboardMarkup:
     )
 
 
+def topic_management(topics) -> InlineKeyboardMarkup:
+    rows = []
+    for topic in topics:
+        label = f"Удалить: {topic.name}"
+        if len(label) > 48:
+            label = f"{label[:47]}…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"topic:delete:{topic.id}")]
+        )
+    rows.append([InlineKeyboardButton(text="Добавить", callback_data="topic:add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def source_management(sources) -> InlineKeyboardMarkup:
+    rows = []
+    for source in sources:
+        label = f"Удалить: {source.name}"
+        if len(label) > 48:
+            label = f"{label[:47]}…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"source:delete:{source.id}")]
+        )
+    rows.append([InlineKeyboardButton(text="Добавить", callback_data="source:add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def action_confirmation(action_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -139,6 +165,23 @@ def conference_actions(
         ]
     if source_url:
         rows.append([InlineKeyboardButton(text="Открыть сайт", url=source_url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def conference_management(tracked, archived) -> InlineKeyboardMarkup:
+    rows = []
+    for conference in (*tracked, *archived):
+        label = f"Удалить: {conference.name}"
+        if len(label) > 48:
+            label = f"{label[:47]}…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"conference:delete:{conference.id}",
+                )
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

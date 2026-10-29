@@ -63,7 +63,19 @@ class OpenAICompatibleGateway:
             content = message.get("content")
             if content is None and not calls:
                 raise KeyError("content")
-            return ChatResponse(content=content or "", tool_calls=calls)
+            raw_model_name = payload.get("model")
+            model_name = (
+                raw_model_name.strip()
+                if isinstance(raw_model_name, str) and raw_model_name.strip()
+                else None
+            )
+            if model_name == model == "auto":
+                model_name = None
+            return ChatResponse(
+                content=content or "",
+                tool_calls=calls,
+                model_name=model_name,
+            )
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise ModelGatewayError("Model service returned an invalid chat response") from exc
 

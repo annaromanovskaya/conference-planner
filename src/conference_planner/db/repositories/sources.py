@@ -46,6 +46,9 @@ class SourceRepository:
     async def list_all(self) -> list[TrustedSource]:
         return list(await self.session.scalars(select(TrustedSource).order_by(TrustedSource.name)))
 
+    async def get(self, source_id: int) -> TrustedSource | None:
+        return await self.session.get(TrustedSource, source_id)
+
     async def create(self, url: str, name: str, source_type: SourceType) -> TrustedSource:
         source = TrustedSource(
             url=url,
@@ -62,7 +65,11 @@ class SourceRepository:
         if source is not None:
             source.enabled = enabled
 
-    async def delete(self, source_id: int) -> None:
+    async def delete(self, source_id: int) -> str | None:
         source = await self.session.get(TrustedSource, source_id)
         if source is not None:
+            name = source_display_name(source)
             await self.session.delete(source)
+            await self.session.flush()
+            return name
+        return None

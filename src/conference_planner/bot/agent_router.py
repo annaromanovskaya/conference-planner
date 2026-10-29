@@ -286,7 +286,11 @@ async def handle_help(message: Message) -> None:
 
 
 async def send_agent_reply(message: Message, reply) -> None:
-    chunks = split_message(sanitize_model_text(reply.text))
+    text = sanitize_model_text(reply.text)
+    model_label = local_model_response_label(reply)
+    if model_label is not None:
+        text = f"{text}\n\nМодель ответа: {model_label}"
+    chunks = split_message(text)
     for index, chunk in enumerate(chunks):
         markup = main_menu() if index == len(chunks) - 1 else None
         await message.answer(chunk, reply_markup=markup)
@@ -295,6 +299,15 @@ async def send_agent_reply(message: Message, reply) -> None:
             f"Требуется подтверждение:\n{pending.summary}",
             reply_markup=action_confirmation(pending.id),
         )
+
+
+def local_model_response_label(reply: AgentReply) -> str | None:
+    if reply.model_profile_id != "llm-local":
+        return None
+    if reply.model_name:
+        return reply.model_name
+    requested = reply.requested_model_name or "неизвестна"
+    return f"{requested} — сервер не сообщил фактическую модель"
 
 
 async def handle_search_query(
@@ -355,10 +368,27 @@ def format_cycle_report(report: ConferenceCycleReport) -> str:
         f"Новых кандидатов: {len(report.new_candidate_ids)}",
         f"Исключено дублей: {report.duplicates}",
         f"Проверено страниц поиска: {report.pages_checked}",
-        f"Ошибок: {len(report.errors)}",
+        f"Ошибки проверки отслеживаемых: {len(report.monitoring_errors)}",
+        f"Ошибки поиска: {len(report.search_errors)}",
     ]
-    if report.errors:
-        lines.extend(("", "Коды ошибок: " + ", ".join(report.errors)))
+    if report.monitoring_errors:
+        lines.extend(("", "Коды проверки: " + ", ".join(report.monitoring_errors)))
+    if report.search_errors:
+        lines.extend(("", "Коды поиска: " + ", ".join(report.search_errors)))
+    search_code = next(
+        (
+            code
+            for code in report.search_errors
+            if code in {"SEARCH_EMPTY", "SEARCH_UNAVAILABLE"}
+        ),
+        None,
+    )
+    if search_code is not None:
+        lines.extend(("", f"Код поиска: {search_code}"))
+        lines.append(f"Попыток поиска: {report.search_attempts}")
+        if report.unresponsive_engines:
+            lines.append("Недоступные движки:")
+            lines.extend(f"- {item}" for item in report.unresponsive_engines)
     lines.extend(("", f"Номер запуска: {report.run_id}."))
     return "\n".join(lines)
 

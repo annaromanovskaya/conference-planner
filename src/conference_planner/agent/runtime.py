@@ -34,6 +34,9 @@ class AgentReply(BaseModel):
     pending_actions: tuple[PendingActionView, ...] = ()
     references: tuple[DomainReference, ...] = ()
     error_code: str | None = None
+    model_profile_id: str | None = None
+    requested_model_name: str | None = None
+    model_name: str | None = None
 
 
 class _RuntimeFailure(RuntimeError):
@@ -162,12 +165,14 @@ class AgentRuntime:
         mutation_requested = self._requests_mutation(text)
         research_requested = self._requests_research(text)
         research_tool_succeeded = False
+        response_model_name: str | None = None
 
         for step in range(self.max_steps):
             if step:
                 await self._emit_progress(progress, "Сопоставляю найденные сведения…")
             try:
                 response = await self.registry.chat(user_id, active, messages, tools)
+                response_model_name = response.model_name
             except ModelGatewayError as exc:
                 raise self._provider_runtime_failure(exc) from exc
             except Exception as exc:
@@ -216,7 +221,14 @@ class AgentRuntime:
                         final_text,
                         append_notice=mutation_requested,
                     )
-                return await self._finish(user_id, final_text, pending, references, active)
+                return await self._finish(
+                    user_id,
+                    final_text,
+                    pending,
+                    references,
+                    active,
+                    model_name=response_model_name,
+                )
 
             messages.append(
                 ChatMessage(
@@ -281,6 +293,7 @@ class AgentRuntime:
                     pending,
                     references,
                     active,
+                    model_name=response_model_name,
                 )
             if receipt_summaries:
                 return await self._finish(
@@ -289,6 +302,7 @@ class AgentRuntime:
                     pending,
                     references,
                     active,
+                    model_name=response_model_name,
                 )
 
         return await self._safe_reply(
@@ -483,6 +497,8 @@ class AgentRuntime:
         pending: Sequence[PendingActionView],
         references: Sequence[DomainReference],
         active,
+        *,
+        model_name: str | None,
     ) -> AgentReply:
         unique_references = self._unique_references(references)
         await self.memory.append_message(
@@ -517,6 +533,9 @@ class AgentRuntime:
             text=text,
             pending_actions=tuple(pending),
             references=unique_references,
+            model_profile_id=active.profile_id,
+            requested_model_name=active.model_name,
+            model_name=model_name,
         )
 
     async def _safe_reply(self, user_id: int, text: str, code: str) -> AgentReply:

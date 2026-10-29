@@ -118,6 +118,17 @@ class AddTopicAction(BaseModel):
         return f"Добавить тему «{self.name}»"
 
 
+class DeleteTopicAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["delete_topic"] = "delete_topic"
+    topic_id: int = Field(gt=0)
+    name: str = Field(min_length=1)
+
+    def confirmation_summary(self) -> str:
+        return f"Удалить тему «{self.name}»"
+
+
 class AddSourceAction(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -129,6 +140,17 @@ class AddSourceAction(BaseModel):
         return f"Добавить источник {self.value}"
 
 
+class DeleteSourceAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["delete_source"] = "delete_source"
+    source_id: int = Field(gt=0)
+    name: str = Field(min_length=1)
+
+    def confirmation_summary(self) -> str:
+        return f"Удалить источник «{self.name}»"
+
+
 class TrackConferenceAction(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -137,6 +159,17 @@ class TrackConferenceAction(BaseModel):
 
     def confirmation_summary(self) -> str:
         return f"Отслеживать конференцию {self.conference_id}"
+
+
+class DeleteConferenceAction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["delete_conference"] = "delete_conference"
+    conference_id: int = Field(gt=0)
+    name: str = Field(min_length=1)
+
+    def confirmation_summary(self) -> str:
+        return f"Удалить конференцию «{self.name}» из моих списков"
 
 
 class ImportConferenceCandidateAction(BaseModel):
@@ -252,8 +285,11 @@ class UpsertDeadlineAction(BaseModel):
 
 ActionPayload = Annotated[
     AddTopicAction
+    | DeleteTopicAction
     | AddSourceAction
+    | DeleteSourceAction
     | TrackConferenceAction
+    | DeleteConferenceAction
     | ImportConferenceCandidateAction
     | ImportConferenceURLAction
     | ArchiveConferenceAction

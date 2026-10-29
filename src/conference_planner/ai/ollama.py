@@ -69,6 +69,11 @@ class OllamaGateway:
                 prompt_tokens=self._usage_counter(payload, "prompt_eval_count"),
                 cached_prompt_tokens=self._usage_counter(payload, "prompt_eval_cached_count"),
                 output_tokens=self._usage_counter(payload, "eval_count"),
+                model_name=(
+                    payload["model"].strip()
+                    if isinstance(payload.get("model"), str) and payload["model"].strip()
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ModelGatewayError("Model service returned an invalid chat response") from exc

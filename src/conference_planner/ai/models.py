@@ -37,6 +37,7 @@ class ChatResponse(BaseModel):
     prompt_tokens: int | None = None
     cached_prompt_tokens: int | None = None
     output_tokens: int | None = None
+    model_name: str | None = None
 
 
 class AvailableModel(BaseModel):

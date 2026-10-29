@@ -65,6 +65,7 @@ from conference_planner.schemas.research import (
 )
 from conference_planner.search.provider import SearchProvider
 from conference_planner.web.fetcher import FetchedPage, FetchError, normalized_content_hash
+from conference_planner.web.access import should_try_reader
 from conference_planner.web.parser import PageLink, extract_page_links, extract_page_text
 from conference_planner.web.recipes import RecipeValidationError, apply_recipe
 
@@ -201,6 +202,7 @@ class MonitoringService:
                 .where(
                     Conference.id == conference_id,
                     Conference.is_test.is_(False),
+                    Conference.is_catalog_source.is_(False),
                     Subscription.user_id == user_id,
                     Subscription.status == ConferenceStatus.TRACKING,
                 )
@@ -351,6 +353,7 @@ class MonitoringService:
                     Subscription.user_id == user_id,
                     Subscription.status == ConferenceStatus.TRACKING,
                     Conference.is_test.is_(False),
+                    Conference.is_catalog_source.is_(False),
                     *(
                         ()
                         if force
@@ -485,9 +488,9 @@ class MonitoringService:
             fetch_kwargs.update(etag=cached.etag, last_modified=cached.last_modified)
         try:
             page = await self.fetcher.fetch(url, **fetch_kwargs)
-        except FetchError:
+        except FetchError as exc:
             reader_text: str | None = None
-            if self.reader is not None:
+            if self.reader is not None and should_try_reader(exc.code):
                 try:
                     reader_text = await self.reader.read(url, max_bytes=self.max_page_bytes)
                 except Exception:
@@ -507,8 +510,11 @@ class MonitoringService:
                         observed_at=self.now_factory(),
                     )
                 return result
+            if exc.code in {"CAPTCHA_REQUIRED", "ACCESS_DENIED", "RATE_LIMITED"}:
+                raise
             if cached is None or not cached.extracted_text.strip():
                 raise
+            logger.warning("using stale cache for inaccessible source %s (reason: %s); results are not freshly verified", url, exc.code)
             return await self._analyze_page_text(url, cached.extracted_text, expected_name)
         if cached is not None and page.not_modified:
             await self.cache.touch(
@@ -666,6 +672,7 @@ class MonitoringService:
             )
             self.session.add(source)
         source.last_checked_at = self.now_factory()
+        conference.is_catalog_source = True
         drafts = [
             CandidateDraft(
                 title=event.name,

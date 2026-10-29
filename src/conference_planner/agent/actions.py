@@ -120,6 +120,9 @@ class ConfirmationService:
         except asyncio.CancelledError:
             await self._mark_failed(user_id, action_id)
             raise
+        except ActionUnavailable:
+            await self._mark_failed(user_id, action_id)
+            raise
         except Exception as exc:
             logger.exception(
                 "pending action execution failed",
