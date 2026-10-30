@@ -10,8 +10,17 @@ RELEVANCE_SYSTEM_PROMPT = """Score only thematic relevance from 0.0 to 1.0.
 Do not score prestige or source trust. Return JSON with score and explanation."""
 
 RESEARCH_RELEVANCE_SYSTEM_PROMPT = """Score only thematic relevance of one scientific
-conference to the supplied user topics from 0.0 to 1.0. Use the structured conference facts and
-topic descriptions only. Do not score prestige, source trust, geography, or date completeness.
+conference to the supplied user topics from 0.0 to 1.0. When programme_evidence is
+provided, prioritize its actual scientific sessions, calls for contributions,
+talk titles and abstract descriptions over the conference title. Treat broadly
+applicable machine-learning methodology as potentially relevant to astronomy
+research even if the event itself is not labelled astronomical. Do not infer
+unpublished sessions or pretend a programme was inspected when no programme
+evidence was provided. The explanation must state concrete matching or
+nonmatching topics and cite the programme source URLs supplied in the data.
+If no programme is available, score conservatively and explain uncertainty;
+absence of keywords in a short title is not evidence of irrelevance.
+Do not score prestige, source trust, geography, or date completeness.
 Return JSON with score and a concise explanation."""
 
 RESEARCH_EXTRACTION_SYSTEM_PROMPT = """Extract evidence-backed facts for exactly one scientific

@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import time
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -9,7 +11,7 @@ import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select, union
+from sqlalchemy import select, union, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conference_planner.agent.actions import ActionUnavailable, ConfirmationService
@@ -41,6 +43,7 @@ from conference_planner.conferences.monitoring import (
 )
 from conference_planner.conferences.persistence import ConferencePersistenceService
 from conference_planner.conferences.research import ConferenceResearchService
+from conference_planner.conferences.page_urls import is_document_url
 from conference_planner.config import Settings
 from conference_planner.db.migrations import run_migrations
 from conference_planner.db.models import (
@@ -52,6 +55,7 @@ from conference_planner.db.models import (
     Subscription,
     Topic,
     DiscoveryJob,
+    DiscoveryURLTask,
 )
 from conference_planner.db.repositories.agent_state import AgentStateRepository
 from conference_planner.db.repositories.agent_workflows import AgentWorkflowRepository
@@ -242,37 +246,73 @@ def _durable_conference_workflow(
         query = str(context.task.input_data.get("query", context.run.request_text))
         # User-configured sources are a first-class discovery channel and are
         # fetched directly even when every SearXNG engine is unavailable.
-        trusted_report = await research.search_trusted_sources(user_id, query)
-        try:
-            search_report = await research.search_fresh(
-                user_id, query, page_limit=5, results_per_page=20,
+        # A resumed job must drain its persisted queue instead of repeating
+        # the entire search and catalog crawl on every worker iteration.
+        from types import SimpleNamespace
+        existing_url_tasks = (await session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
+            DiscoveryURLTask.job_id == discovery_job_id,
+        ))) if discovery_job_id is not None else 0
+        if existing_url_tasks:
+            # A crash may have interrupted catalog crawling before it completed.
+            # Drain remaining catalog tasks without repeating completed pages.
+            pending_catalogs = await session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == discovery_job_id,
+                DiscoveryURLTask.task_type == "CATALOG",
+                DiscoveryURLTask.status.in_(["PENDING", "RUNNING"]),
+            ))
+            if pending_catalogs:
+                trusted_report = await research.search_trusted_sources(
+                    user_id, query,
+                    max_depth=int(os.getenv("DISCOVERY_CRAWL_DEPTH", "4")),
+                    max_pages=int(os.getenv("DISCOVERY_CRAWL_MAX_PAGES", "200")),
+                )
+            else:
+                trusted_report = {"new_ids": (), "active_ids": (), "sources_opened": 0,
+                                  "errors": (), "pending_catalogs": 0}
+            search_report = SimpleNamespace(active_ids=(), new_ids=(), search_attempts=0,
+                                            duplicates=0, error_code=None)
+        else:
+            trusted_report = await research.search_trusted_sources(
+                user_id, query,
+                max_depth=int(os.getenv("DISCOVERY_CRAWL_DEPTH", "4")),
+                max_pages=int(os.getenv("DISCOVERY_CRAWL_MAX_PAGES", "200")),
             )
-        except Exception as exc:
-            # A failed external search must not discard results from the
-            # independent configured-source crawler.
-            await session.rollback()
-            from types import SimpleNamespace
-            search_report = SimpleNamespace(
-                active_ids=(), new_ids=(), search_attempts=0,
-                duplicates=0, error_code="SEARCH_UNAVAILABLE",
-            )
-            logger.warning("SearXNG search failed after trusted source crawl: %s", type(exc).__name__)
+            try:
+                search_report = await research.search_fresh(
+                    user_id, query, page_limit=5, results_per_page=20,
+                )
+            except Exception as exc:
+                await session.rollback()
+                search_report = SimpleNamespace(
+                    active_ids=(), new_ids=(), search_attempts=0,
+                    duplicates=0, error_code="SEARCH_UNAVAILABLE",
+                )
+                logger.warning("SearXNG search failed after trusted source crawl: %s", type(exc).__name__)
         direct_ids = list(trusted_report["new_ids"])
         combined_new_ids = list(dict.fromkeys([*direct_ids, *search_report.new_ids]))
         combined_active_ids = list(dict.fromkeys([
             *trusted_report["active_ids"], *search_report.active_ids,
         ]))
-        # Revisit candidates already discovered in earlier runs. Only-new
-        # selection caused subsequent searches to inspect zero pages.
-        candidates_for_check = list(await session.scalars(
-            select(EventCandidate).where(
-                EventCandidate.user_id == user_id,
-                EventCandidate.id.in_(combined_active_ids),
-                EventCandidate.status == CandidateStatus.ACTIVE,
-                EventCandidate.researched_at.is_(None),
-            )
-        )) if combined_active_ids else []
+        # Resume all previously discovered active, unfinished candidates,
+        # including candidates from completed catalog-URL tasks.
+        candidates_for_check = list(await session.scalars(select(EventCandidate).where(
+            EventCandidate.user_id == user_id,
+            EventCandidate.status == CandidateStatus.ACTIVE,
+            EventCandidate.researched_at.is_(None),
+        )))
         requested_years = set(re.findall(r"\b20\d{2}\b", query))
+        def is_catalog_reference(item):
+            # Trusted-source crawler already opens these general indexes. Do
+            # not spend the limited event-inspection budget on them.
+            from urllib.parse import urlsplit
+            parsed = urlsplit(item.source_url)
+            path = parsed.path.rstrip("/").casefold()
+            return (
+                path in ("/sci/meetings", "/sci/meetings/garching", "/sci/meetings/santiago",
+                         "/sci/meetings/conferences", "/sci/meetings/past-meetings-chile1",
+                         "/en/meetings/recent", "/en/meetings/this-month")
+                or bool(re.search(r"(?:^|/)(?:past-meetings[^/]*|codeofconductworkshops)(?:\.html)?$", path))
+            )
         def priority(item):
             from urllib.parse import urlsplit
             text = f"{item.title} {item.source_url}".casefold()
@@ -284,39 +324,179 @@ def _durable_conference_workflow(
                 "sai.msu.ru", "inasan.ru", "esa.int",
             ))
             document = bool(re.search(r"\.(?:pdf|docx?|xlsx?)(?:$|[?#])", item.source_url, re.I))
-            return (document, has_other_year and not year_matches,
-                    not year_matches, not official, -(item.relevance_score or 0), item.id)
+            is_programme = bool(re.search(
+                r"(?:programme?|sessions?|abstracts?|symposi(?:um|a)|workshop|conference|meeting)",
+                text, re.I,
+            ))
+            return (is_catalog_reference(item), document,
+                    has_other_year and not year_matches,
+                    not year_matches, not is_programme,
+                    not official, -(item.relevance_score or 0), item.id)
         candidates_for_check.sort(key=priority)
-        inspection_ids = [item.id for item in candidates_for_check[:12]]
+        event_candidates = [item for item in candidates_for_check
+                            if not is_catalog_reference(item) and not is_document_url(item.source_url)]
+        # No arbitrary candidate-count cutoff. Inspect the complete available
+        # queue while execution time permits. Remaining candidates persist in
+        # SQLite for a subsequent continuation (never silently discarded).
+        # Persist one inspection task per candidate, without an arbitrary
+        # candidate-count cap. Restarting the same job does not repeat DONE.
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        if discovery_job_id is not None:
+            # Retire old file URLs already queued by previous releases, without
+            # deleting evidence or touching the remaining HTML work items.
+            stale = list(await session.scalars(select(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == discovery_job_id,
+                DiscoveryURLTask.status.in_(["PENDING", "RUNNING"]),
+            )))
+            for task in stale:
+                if is_document_url(task.url):
+                    task.status = "SKIPPED"
+                    task.error_code = "NON_HTML_DOCUMENT"
+                    task.lease_until = None
+            await session.commit()
+            # Never automatically reclaim a permanently FAILED inspection within
+            # the same discovery job. Subsequent new jobs may retry it.
+            exhausted = list(await session.scalars(select(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == discovery_job_id,
+                DiscoveryURLTask.task_type == "INSPECT",
+                DiscoveryURLTask.attempts >= 3,
+                DiscoveryURLTask.status.in_(["PENDING", "RUNNING"]),
+            )))
+            for task in exhausted:
+                task.status = "FAILED"
+                task.lease_until = None
+                task.next_retry_at = None
+                task.error_code = task.error_code or "RETRIES_EXHAUSTED"
+            await session.commit()
+            for item in event_candidates:
+                normalized = f"candidate:{item.id}"
+                await session.execute(sqlite_insert(DiscoveryURLTask).values(
+                    job_id=discovery_job_id, url=item.source_url,
+                    normalized_url=normalized, candidate_id=item.id,
+                    root_url=item.source_url, parent_url=None, label=item.title[:300],
+                    task_type="INSPECT", depth=0, priority=0,
+                    status="PENDING", attempts=0,
+                    created_at=datetime.now(UTC).replace(tzinfo=None),
+                    updated_at=datetime.now(UTC).replace(tzinfo=None),
+                ).on_conflict_do_nothing(index_elements=["job_id", "normalized_url", "task_type"]))
+            await session.commit()
+        inspection_deadline = time.monotonic() + max(
+            60, int(os.getenv("DISCOVERY_INSPECTION_SECONDS", "1200"))
+        )
+        inspections_started = 0
         # Research bounded candidate pages now, rather than treating SearXNG
         # snippets as checked conference sites. Record URL-level evidence.
         verified_pages = 0
         verification_errors = 0
         verified_candidate_ids = []
         model_errors = 0
+        rejected_candidates = 0
+        deferred_candidates = 0
         if discovery_job_id is not None:
             from conference_planner.db.models import DiscoverySearchAudit
             from conference_planner.conferences.research import CatalogExpansion
-            for candidate_id in inspection_ids:
-                candidate = await research.repository.get_candidate(user_id, candidate_id)
-                url = candidate.source_url
+            while time.monotonic() < inspection_deadline:
+                now = datetime.now(UTC).replace(tzinfo=None)
+                inspection_task = await session.scalar(select(DiscoveryURLTask).where(
+                    DiscoveryURLTask.job_id == discovery_job_id,
+                    DiscoveryURLTask.task_type == "INSPECT",
+                    (DiscoveryURLTask.attempts < 3),
+                    or_(
+                        (DiscoveryURLTask.status == "PENDING") & (
+                            (DiscoveryURLTask.next_retry_at.is_(None)) |
+                            (DiscoveryURLTask.next_retry_at <= now)
+                        ),
+                        (DiscoveryURLTask.status == "RUNNING") & (
+                            (DiscoveryURLTask.lease_until.is_(None)) |
+                            (DiscoveryURLTask.lease_until < now)
+                        ),
+                    ),
+                ).order_by(DiscoveryURLTask.attempts, DiscoveryURLTask.priority, DiscoveryURLTask.id).limit(1))
+                if inspection_task is None:
+                    break
+                inspection_task.status = "RUNNING"
+                inspection_task.attempts += 1
+                inspect_timeout = max(15, int(os.getenv("DISCOVERY_INSPECT_TIMEOUT_SECONDS", "180")))
+                inspection_task.lease_until = (datetime.now(UTC) + timedelta(seconds=inspect_timeout + 60)).replace(tzinfo=None)
+                inspection_task.next_retry_at = None
+                candidate_id = inspection_task.candidate_id
+                inspection_task_id = inspection_task.id
+                await session.commit()
+                inspections_started += 1
                 try:
-                    result = await research.inspect(user_id, candidate_id)
+                    candidate = await research.repository.get_candidate(user_id, candidate_id)
+                except Exception as exc:
+                    logger.warning("Candidate %s cannot be loaded: %s", candidate_id, type(exc).__name__)
+                    await session.rollback()
+                    inspection_task = await session.get(DiscoveryURLTask, inspection_task_id)
+                    inspection_task.status = "FAILED"
+                    inspection_task.error_code = "CANDIDATE_LOAD_FAILED"
+                    inspection_task.lease_until = None
+                    await session.commit()
+                    continue
+                if candidate is None:
+                    inspection_task = await session.get(DiscoveryURLTask, inspection_task_id)
+                    inspection_task.status = "SKIPPED"
+                    inspection_task.error_code = "CANDIDATE_MISSING"
+                    inspection_task.lease_until = None
+                    await session.commit()
+                    continue
+                url = candidate.source_url
+                # Retire invalid or generic index pages already persisted by older releases.
+                if is_document_url(url) or is_catalog_reference(candidate):
+                    inspection_task = await session.get(DiscoveryURLTask, inspection_task_id)
+                    inspection_task.status = "SKIPPED"
+                    inspection_task.error_code = (
+                        "NON_HTML_DOCUMENT" if is_document_url(url) else "CATALOG_REFERENCE"
+                    )
+                    inspection_task.lease_until = None
+                    await session.commit()
+                    continue
+                try:
+                    # The lease is not a timeout. Bound the *whole* operation,
+                    # including model calls, downloads, and nested page requests.
+                    async with asyncio.timeout(inspect_timeout):
+                        result = await research.inspect(user_id, candidate_id)
                     checked = not isinstance(result, CatalogExpansion)
                     status = "RESEARCHED" if checked else "CATALOG_EXPANDED"
                     verified_pages += 1  # successful URL inspection, including expanded catalogs
                     if checked:
                         verified_candidate_ids.append(candidate_id)
                 except Exception as exc:
-                    verification_errors += 1
-                    if type(exc).__name__ == "ModelGatewayError":
-                        model_errors += 1
-                    status = "INSPECTION_FAILED"
-                    diagnostic = type(exc).__name__
+                    reason = "INSPECTION_TIMEOUT" if isinstance(exc, TimeoutError) else type(exc).__name__
+                    # Ineligible and expired candidates are assessment outcomes,
+                    # not infrastructure failures. Preserve this distinction in
+                    # both the audit and the Telegram counters.
+                    if reason == "CandidateExpiredError":
+                        status = "EVENT_EXPIRED"
+                        rejected_candidates += 1
+                    elif reason in ("CandidateUnusableError", "CandidateRejectedError"):
+                        status = "NOT_VERIFIABLE" if reason == "CandidateUnusableError" else "NOT_CONFERENCE"
+                        deferred_candidates += 1
+                    else:
+                        verification_errors += 1
+                        if reason in ("ModelGatewayError", "AIResponseError"):
+                            model_errors += 1
+                        status = "INSPECTION_FAILED"
+                    diagnostic = f"{reason}: {str(exc)[:160]}" if str(exc) else reason
+                    logger.warning("Conference inspection %s for %s: %s", status, url, diagnostic)
                     # An exception can leave SQLAlchemy in an invalid transaction.
                     await session.rollback()
                 else:
                     diagnostic = None
+                inspection_task = await session.get(DiscoveryURLTask, inspection_task_id)
+                inspection_task.lease_until = None
+                inspection_task.error_code = diagnostic[:120] if diagnostic else None
+                # Fresh candidates go first; retry failures only after backoff.
+                # Persist cooldown so restarts cannot reset it.
+                if status == "INSPECTION_FAILED" and inspection_task.attempts < 3:
+                    inspection_task.status = "PENDING"
+                    inspection_task.next_retry_at = (
+                        datetime.now(UTC) + timedelta(seconds=30 * 3 ** (inspection_task.attempts - 1))
+                    ).replace(tzinfo=None)
+                else:
+                    inspection_task.status = "FAILED" if status == "INSPECTION_FAILED" else "DONE"
+                    inspection_task.next_retry_at = None
                 session.add(DiscoverySearchAudit(
                     job_id=discovery_job_id, query="[candidate page]", page=1,
                     result_count=0, retained_count=0, ignored_count=0,
@@ -324,6 +504,9 @@ def _durable_conference_workflow(
                     urls=[{"url": url, "decision": status}],
                 ))
                 await session.commit()
+        remaining = (await session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
+            DiscoveryURLTask.job_id == discovery_job_id,
+            DiscoveryURLTask.status.in_(["PENDING", "RUNNING"])))) if discovery_job_id is not None else 0
         if on_discovery_progress is not None:
             # The progress callback opens an independent session: release any
             # search transaction before attempting to update its job row.
@@ -333,7 +516,7 @@ def _durable_conference_workflow(
                 created_ids=combined_new_ids,
                 pages_checked=verified_pages + trusted_report["sources_opened"],
                 search_attempts=search_report.search_attempts,
-                rejected_urls=[],
+                rejected_urls=["ineligible"] * (rejected_candidates + deferred_candidates),
                 errors=([search_report.error_code] if search_report.error_code and not trusted_report["sources_opened"] else []) + list(trusted_report["errors"]) + ["INSPECTION_FAILED"] * verification_errors,
             ), query)
         return TaskArtifact(
@@ -344,13 +527,18 @@ def _durable_conference_workflow(
                      "verified_pages": verified_pages,
                      "verified_candidate_ids": verified_candidate_ids,
                      "model_errors": model_errors,
-                     "pending_verification": max(0, len(candidates_for_check)-len(inspection_ids)),
+                     "pending_verification": remaining,
+                     "pending_url_tasks": remaining,
+                     "catalog_references_skipped": len(candidates_for_check)-len(event_candidates),
+                     "not_verifiable": deferred_candidates,
+                     "expired": rejected_candidates,
                      "trusted_sources_opened": trusted_report["sources_opened"],
+                     "pending_catalogs": trusted_report["pending_catalogs"],
                      "verification_errors": verification_errors,
                      "duplicates": search_report.duplicates,
                      "error_code": (search_report.error_code if not trusted_report["sources_opened"] and not combined_new_ids
-                                    else "PARTIAL_VERIFICATION" if verification_errors or trusted_report["pending_catalogs"]
-                                    else "VERIFICATION_BUDGET_REACHED" if len(candidates_for_check) > len(inspection_ids)
+                                    else "PARTIAL_VERIFICATION" if verification_errors or remaining
+                                    else "VERIFICATION_BUDGET_REACHED" if remaining
                                     else "NO_VERIFIED_EVENTS" if not verified_candidate_ids else None)},
         )
 

@@ -649,3 +649,27 @@ class DiscoverySearchAudit(Base):
     diagnostics: Mapped[list[str]] = mapped_column(JSON, default=list)
     urls: Mapped[list[dict]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class DiscoveryURLTask(Base):
+    """Persistent unit of a source crawl. The worker leases one URL at a time."""
+    __tablename__ = "discovery_url_tasks"
+    __table_args__ = (UniqueConstraint("job_id", "normalized_url", "task_type", name="uq_discovery_url_task"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("discovery_jobs.id", ondelete="CASCADE"), index=True)
+    url: Mapped[str] = mapped_column(String(2048))
+    normalized_url: Mapped[str] = mapped_column(String(2048))
+    parent_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    candidate_id: Mapped[int | None] = mapped_column(ForeignKey("event_candidates.id", ondelete="SET NULL"), nullable=True)
+    root_url: Mapped[str] = mapped_column(String(2048))
+    label: Mapped[str] = mapped_column(String(300), default="")
+    task_type: Mapped[str] = mapped_column(String(30), default="CATALOG")
+    depth: Mapped[int] = mapped_column(default=0)
+    priority: Mapped[int] = mapped_column(default=0)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    attempts: Mapped[int] = mapped_column(default=0)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)

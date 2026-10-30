@@ -9,6 +9,8 @@ depends_on = None
 
 
 def upgrade():
+    if sa.inspect(op.get_bind()).has_table("discovery_search_audit"):
+        return
     op.create_table(
         "discovery_search_audit",
         sa.Column("id", sa.Integer(), primary_key=True),

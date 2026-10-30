@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select, update
 
 from conference_planner.db.base import utc_now
-from conference_planner.db.models import DiscoveryJob, DiscoverySearchAudit
+from conference_planner.db.models import DiscoveryJob, DiscoverySearchAudit, DiscoveryURLTask
 from conference_planner.schemas.common import AgentTaskType, AgentRunStatus, WorkflowKind
 from conference_planner.schemas.workflows import WorkflowBudget, WorkflowPlan, WorkflowTaskSpec
 
@@ -29,7 +29,38 @@ def keyboard(job_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def render(job: DiscoveryJob) -> str:
+def summarize_progress(records, tasks):
+    """One source of truth for the Telegram card and detailed report."""
+    sources = [r for r in records if r.query.startswith("[trusted source]")]
+    visits = [r for r in records if r.query == "[candidate page]"]
+    searches = [r for r in records if r.query != "[candidate page]" and not r.query.startswith("[trusted source]")]
+    return {
+        "catalogs": sum(r.status in ("SOURCE_OPENED", "CATALOG_OPENED") for r in sources),
+        "researched": sum(r.status == "RESEARCHED" for r in visits),
+        "expanded": sum(r.status == "CATALOG_EXPANDED" for r in visits),
+        "errors": sum(r.status in ("INSPECTION_FAILED", "SOURCE_ERROR") for r in records),
+        "ineligible": sum(r.status in ("NOT_VERIFIABLE", "NOT_CONFERENCE", "EVENT_EXPIRED") for r in visits),
+        "pending": sum(t.status == "PENDING" for t in tasks),
+        "running": sum(t.status == "RUNNING" for t in tasks),
+        "skipped_files": sum(t.status == "SKIPPED" and t.error_code == "NON_HTML_DOCUMENT" for t in tasks),
+        "queries": len(searches),
+        "search_hits": sum(r.result_count for r in searches),
+    }
+
+
+def progress_lines(metrics):
+    return [
+        f"Открыто страниц источников: {metrics['catalogs']}",
+        f"Успешно исследовано страниц кандидатов: {metrics['researched']}",
+        f"Раскрыто каталогов при проверке: {metrics['expanded']}",
+        f"Отклонено по содержимому / срокам: {metrics['ineligible']}",
+        f"Технических ошибок: {metrics['errors']}",
+        f"Очередь: {metrics['pending']} ожидают, {metrics['running']} выполняются",
+        f"Пропущено файлов: {metrics['skipped_files']}",
+    ]
+
+
+def render(job: DiscoveryJob, metrics=None) -> str:
     states = {
         "QUEUED": "⏳ Поиск конференций в очереди",
         "RUNNING": "🔎 Поиск конференций выполняется",
@@ -42,17 +73,16 @@ def render(job: DiscoveryJob) -> str:
     }
     stages = {"QUEUED": "Ожидание", "SEARCH": "Агент: поиск и анализ сайтов",
               "VERIFY": "Проверка найденных страниц", "DONE": "Завершено"}
-    processed = str(job.processed) if job.total is None else f"{job.processed} / {job.total}"
     lines = [states.get(job.status, job.status),
              f"Годы: {', '.join(map(str, job.years))}",
              f"Этап: {stages.get(job.stage, job.stage)}", ""]
-    if job.total is not None and job.total > 0:
-        ratio = min(1, job.processed / job.total)
-        filled = round(ratio * 10)
-        lines.append("▰" * filled + "▱" * (10 - filled) + f" {ratio:.0%}")
-    lines.extend([f"Исследовано сайтов: {processed}", f"Сохранено ссылок-кандидатов (не подтверждены): {job.found}",
-                  f"Отклонено: {job.rejected}", f"Ошибки: {job.errors}"])
-    if job.error_code:
+    if metrics is not None:
+        lines.extend(progress_lines(metrics))
+    else:
+        lines.extend([f"Исследовано сайтов: {job.processed}",
+                      f"Сохранено ссылок-кандидатов: {job.found}",
+                      f"Отклонено: {job.rejected}", f"Ошибки: {job.errors}"])
+    if job.error_code and job.status not in ("QUEUED", "RUNNING"):
         lines.append(f"Причина: {job.error_code[:120]}")
     return "\n".join(lines)
 
@@ -134,7 +164,12 @@ class DiscoveryProgressController:
         async def status(callback: CallbackQuery):
             job = await self._owned_job(callback)
             if job:
-                await callback.answer(f"{job.status}: проверено {job.processed} страниц", show_alert=True)
+                async with self.sessions() as session:
+                    metrics = await self._progress(session, job.id)
+                await callback.answer(
+                    f"{job.status}: {metrics['catalogs']} каталогов, "
+                    f"{metrics['researched']} проверено, {metrics['pending']} в очереди, "
+                    f"{metrics['errors']} ошибок", show_alert=True)
 
         @router.callback_query(F.data.startswith("discovery:details:"))
         async def details(callback: CallbackQuery):
@@ -206,16 +241,14 @@ class DiscoveryProgressController:
         if not records:
             return "Журнал поисковых запросов пока пуст. Ни одна страница не подтверждена."
         searches = [row for row in records if row.query != "[candidate page]" and not row.query.startswith("[trusted source]")]
-        sources = [row for row in records if row.query.startswith("[trusted source]")]
-        visits = [row for row in records if row.query == "[candidate page]"]
-        checked = sum(row.result_count for row in searches)
+        async with self.sessions() as session:
+            tasks = list(await session.scalars(select(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == job_id)))
+        metrics = summarize_progress(records, tasks)
         lines = [f"📄 Отчёт о поиске №{job_id}",
-                 f"Запросов к SearXNG: {len(searches)}",
-                 f"Открыто каталогов и страниц источников: {sum(row.status in ("SOURCE_OPENED", "CATALOG_OPENED") for row in sources)}",
-                 f"Ссылок в выдаче (с повторами): {checked}",
-                 f"Успешных проверок страниц кандидатов: {sum(r.status == 'RESEARCHED' for r in visits)}",
-                 f"Раскрыто каталогов при проверке: {sum(r.status == 'CATALOG_EXPANDED' for r in visits)}",
-                 f"Неудачных проверок: {sum(r.status == 'INSPECTION_FAILED' for r in visits)}", ""]
+                 f"Запросов к SearXNG: {metrics['queries']}",
+                 f"Ссылок в выдаче (с повторами): {metrics['search_hits']}",
+                 *progress_lines(metrics), ""]
         for row in records[-12:]:
             if row.query == "[candidate page]":
                 lines.append(f"• Проверка сайта: {row.status}")
@@ -225,8 +258,16 @@ class DiscoveryProgressController:
             for hit in (row.urls or [])[:5]:
                 lines.append(f"  {hit.get('decision')}: {hit.get('url')}")
             if row.diagnostics:
-                lines.append(f"  Ошибки движков: {', '.join(row.diagnostics)[:240]}")
+                label = "Диагностика" if row.query == "[candidate page]" else "Ошибки / диагностика"
+                lines.append(f"  {label}: {', '.join(row.diagnostics)[:240]}")
         return "\n".join(lines)[:3900]
+
+    async def _progress(self, session, job_id):
+        audits = list(await session.scalars(select(DiscoverySearchAudit).where(
+            DiscoverySearchAudit.job_id == job_id)))
+        tasks = list(await session.scalars(select(DiscoveryURLTask).where(
+            DiscoveryURLTask.job_id == job_id)))
+        return summarize_progress(audits, tasks)
 
     async def latest_search_report(self, user_id: int) -> str:
         async with self.sessions() as session:
@@ -359,14 +400,20 @@ class DiscoveryProgressController:
                     artifacts = list(await session.scalars(select(AgentArtifact).where(
                         AgentArtifact.run_id == result.id
                     )))
-                    search_code = next((a.payload.get("error_code") for a in artifacts
-                                        if a.artifact_kind == "candidate_list"), None)
+                    candidate_payload = next((a.payload for a in artifacts
+                                              if a.artifact_kind == "candidate_list"), {})
+                    search_code = candidate_payload.get("error_code")
+                    pending_tasks = int(candidate_payload.get("pending_url_tasks") or 0)
                     job.status = "CANCELLED" if job.status == "CANCEL_REQUESTED" else (
                         "PARTIAL" if result.status != AgentRunStatus.COMPLETED else
                         "EMPTY" if search_code in ("SEARCH_EMPTY", "NO_RELEVANT_RESULTS") else
                         "PARTIAL" if search_code else "COMPLETED")
                     job.error_code = search_code
-                    job.stage = "DONE"
+                    if pending_tasks and result.status == AgentRunStatus.COMPLETED and job.status != "CANCELLED":
+                        job.status = "QUEUED"
+                        job.stage = "SEARCH"
+                    else:
+                        job.stage = "DONE"
                     job.agent_run_id = result.id
                     await session.commit()
         except asyncio.CancelledError:
@@ -393,10 +440,13 @@ class DiscoveryProgressController:
                         DiscoveryJob.message_id.is_not(None),
                         DiscoveryJob.chat_id.is_not(None),
                     ).order_by(DiscoveryJob.id.desc()).limit(30)))
-                    snapshots = [(
-                        job.id, job.chat_id, job.message_id, job.status,
-                        job.notified, render(job),
-                    ) for job in rows]
+                    snapshots = []
+                    for job in rows:
+                        metrics = await self._progress(session, job.id)
+                        snapshots.append((
+                            job.id, job.chat_id, job.message_id, job.status,
+                            job.notified, render(job, metrics),
+                        ))
                 for job_id, chat_id, message_id, status, notified, body in snapshots:
                     try:
                         await self.update_report(job_id)

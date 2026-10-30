@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from collections.abc import Awaitable, Callable
 from collections import deque
@@ -8,9 +9,10 @@ from difflib import SequenceMatcher
 from typing import ClassVar, Protocol
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import select, update, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from conference_planner.conferences.page_urls import is_document_url
 from conference_planner.ai.gateway import ModelGatewayError
 from conference_planner.ai.service import AIResponseError
 from conference_planner.conferences.candidate_policy import (
@@ -36,7 +38,7 @@ from conference_planner.conferences.temporal import (
     extract_temporal_research,
     merge_temporal_research,
 )
-from conference_planner.db.models import EventCandidate, DiscoverySearchAudit, TrustedSource
+from conference_planner.db.models import EventCandidate, DiscoverySearchAudit, DiscoveryURLTask, TrustedSource
 from conference_planner.db.repositories.conference_research import (
     CandidateDraft,
     ConferenceResearchRepository,
@@ -233,10 +235,18 @@ class ConferenceResearchService:
                 r"(?:^|\.)iau\.org$|(?:^|\.)eso\.org$|(?:^|\.)aas\.org$",
                 urlsplit(url).hostname or "", re.I
             )) and has_scientific_event_evidence(result.title, result.snippet, url)
-            if keyword_relevance.explicitly_irrelevant and not official_meeting:
-                inspected_results.append({"url": url, "decision": "TOPIC_MISMATCH"})
-                continue
-            inspected_results.append({"url": url, "decision": "UNVERIFIED_CANDIDATE"})
+            # A snippet does not contain the conference programme. A zero keyword
+            # overlap is not proof of topical irrelevance (e.g. AISTATS or a
+            # cross-disciplinary scientific meeting). Defer the final verdict
+            # until the actual website/programme has been inspected.
+            inspected_results.append({
+                "url": url,
+                "decision": (
+                    "TOPIC_REVIEW_REQUIRED"
+                    if keyword_relevance.explicitly_irrelevant and not official_meeting
+                    else "UNVERIFIED_CANDIDATE"
+                ),
+            })
             seen_identities.add(identity)
             drafts.append(
                 CandidateDraft(
@@ -299,45 +309,107 @@ class ConferenceResearchService:
         user_id: int,
         query: str,
         *,
-        max_sources: int = 12,
-        max_links_per_source: int = 15,
-        max_depth: int = 2,
-        max_pages: int = 24,
+        max_sources: int | None = None,
+        max_links_per_source: int | None = None,
+        max_depth: int = 4,
+        max_pages: int = 200,
     ) -> dict:
         """Bounded, independent crawl of enabled user sources, without SearXNG.
 
         Counts actual fetched pages and records each URL and decision. Extracted
         URLs remain UNVERIFIABLE until inspect() validates source evidence.
         """
-        sources = list(await self.session.scalars(
-            select(TrustedSource).where(TrustedSource.enabled.is_(True))
-            .order_by(TrustedSource.id).limit(max_sources)
-        ))
+        source_query = (select(TrustedSource).where(TrustedSource.enabled.is_(True))
+                        .order_by(TrustedSource.id))
+        if max_sources is not None:
+            source_query = source_query.limit(max_sources)
+        sources = list(await self.session.scalars(source_query))
         years = set(re.findall(r"\b20\d{2}\b", query))
         seen: set[str] = set()
         queued: set[str] = set()
         queue: deque[tuple[str, int, str, str]] = deque()
-        for source in sources:
-            if source.source_type in {SourceType.PAGE, SourceType.DOMAIN}:
-                queue.append((source.url, 0, source.url, source.name))
-                queued.add(canonical_url(source.url) or source.url)
+        if self.discovery_job_id is not None:
+            # Seed idempotently. Existing DONE records are not reprocessed on restart.
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            for source in sources:
+                if source.source_type in {SourceType.PAGE, SourceType.DOMAIN}:
+                    key = canonical_url(source.url) or source.url
+                    await self.session.execute(sqlite_insert(DiscoveryURLTask).values(
+                        job_id=self.discovery_job_id, url=source.url, normalized_url=key,
+                        root_url=source.url, label=source.name, depth=0, priority=0,
+                        task_type="CATALOG", status="PENDING", attempts=0,
+                        created_at=datetime.now(UTC).replace(tzinfo=None),
+                        updated_at=datetime.now(UTC).replace(tzinfo=None),
+                    ).on_conflict_do_nothing(index_elements=["job_id", "normalized_url", "task_type"]))
+            await self.session.commit()
+        else:
+            for source in sources:
+                if source.source_type in {SourceType.PAGE, SourceType.DOMAIN}:
+                    queue.append((source.url, 0, source.url, source.name))
+                    queued.add(canonical_url(source.url) or source.url)
         added_ids: list[int] = []
         active_ids: list[int] = []
         errors: list[str] = []
         opened = 0
         inspected_candidates: set[str] = set()
-        while queue and opened < max_pages and len(inspected_candidates) < 60:
-            url, depth, root, label = queue.popleft()
+        while opened < max_pages:
+            task = None
+            if self.discovery_job_id is not None:
+                now = datetime.now(UTC).replace(tzinfo=None)
+                task = await self.session.scalar(select(DiscoveryURLTask).where(
+                    DiscoveryURLTask.job_id == self.discovery_job_id,
+                    DiscoveryURLTask.task_type == "CATALOG",
+                    DiscoveryURLTask.attempts < 3,
+                    or_(
+                        (DiscoveryURLTask.status == "PENDING") & (
+                            (DiscoveryURLTask.next_retry_at.is_(None)) |
+                            (DiscoveryURLTask.next_retry_at <= now)
+                        ),
+                        (DiscoveryURLTask.status == "RUNNING") & (
+                            (DiscoveryURLTask.lease_until.is_(None)) |
+                            (DiscoveryURLTask.lease_until < now)
+                        ),
+                    ),
+                ).order_by(DiscoveryURLTask.attempts, DiscoveryURLTask.depth, DiscoveryURLTask.priority, DiscoveryURLTask.id).limit(1))
+                if task is None:
+                    break
+                if is_document_url(task.url):
+                    task.status = "SKIPPED"
+                    task.error_code = "NON_HTML_DOCUMENT"
+                    task.lease_until = None
+                    await self.session.commit()
+                    continue
+                task.status = "RUNNING"
+                task.attempts += 1
+                fetch_timeout = max(10, int(os.getenv("DISCOVERY_CATALOG_TIMEOUT_SECONDS", "60")))
+                task.lease_until = (datetime.now(UTC) + timedelta(seconds=fetch_timeout + 60)).replace(tzinfo=None)
+                task.next_retry_at = None
+                await self.session.commit()
+                task_id = task.id
+                url, depth, root, label = task.url, task.depth, task.root_url, task.label
+            else:
+                if not queue:
+                    break
+                url, depth, root, label = queue.popleft()
+            if is_document_url(url):
+                # Non-HTML source URLs must not reach the page fetcher.
+                if task is not None:
+                    task.status = "SKIPPED"
+                    task.error_code = "NON_HTML_DOCUMENT"
+                    task.lease_until = None
+                    await self.session.commit()
+                continue
             key = canonical_url(url) or url
             if key in seen:
                 continue
             seen.add(key)
             log_urls = [{"url": url, "decision": "FETCH_ATTEMPT", "depth": depth}]
             try:
-                page = await self.fetcher.fetch(url, max_bytes=self.max_page_bytes)
+                async with asyncio.timeout(max(10, int(os.getenv("DISCOVERY_CATALOG_TIMEOUT_SECONDS", "60")))):
+                    page = await self.fetcher.fetch(url, max_bytes=self.max_page_bytes)
                 opened += 1
                 page_text = extract_page_text(page.html, max_chars=self.max_page_chars)
-                links = extract_page_links(page.html, page.url, max_links=200)
+                links = extract_page_links(page.html, page.url, max_links=2000)
                 log_urls[0]["decision"] = "SOURCE_OPENED" if depth == 0 else "CATALOG_OPENED"
                 # A catalog is recognised from both URL and anchor semantics.
                 catalog_links = 0
@@ -348,7 +420,7 @@ class ConferenceResearchService:
                         continue
                     text = f"{link.text} {link.url}"
                     # HTML crawler cannot parse PDF/Word. Do not queue these as pages.
-                    if re.search(r"\.(?:pdf|docx?|xlsx?|pptx?|zip)(?:[?#]|$)", link.url, re.I):
+                    if is_document_url(link.url):
                         log_urls.append({"url": link.url, "decision": "DOCUMENT_SKIPPED"})
                         continue
                     if clearly_not_conference(link.text, text):
@@ -371,16 +443,27 @@ class ConferenceResearchService:
                         r"/conference/(?:index|annconf)/?)", link.url, re.I
                     ))
                     if directory and depth < max_depth and target not in queued:
-                        queue.append((link.url, depth + 1, root, label))
+                        if self.discovery_job_id is not None:
+                            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+                            await self.session.execute(sqlite_insert(DiscoveryURLTask).values(
+                                job_id=self.discovery_job_id, url=link.url, normalized_url=target,
+                                parent_url=page.url, root_url=root, label=label,
+                                task_type="CATALOG", status="PENDING", depth=depth + 1,
+                                priority=0, attempts=0,
+                                created_at=datetime.now(UTC).replace(tzinfo=None),
+                                updated_at=datetime.now(UTC).replace(tzinfo=None),
+                            ).on_conflict_do_nothing(index_elements=["job_id", "normalized_url", "task_type"]))
+                        else:
+                            queue.append((link.url, depth + 1, root, label))
                         queued.add(target)
                         catalog_links += 1
                         log_urls.append({"url": link.url, "decision": "CATALOG_QUEUED"})
-                    elif len(drafts) < max_links_per_source and target not in inspected_candidates:
+                    elif (max_links_per_source is None or len(drafts) < max_links_per_source) and target not in inspected_candidates:
                         inspected_candidates.add(target)
                         drafts.append(CandidateDraft(
                             title=link.text[:500], source_url=link.url,
                             query=query, relevance_score=0.5,
-                            summary=f"Linked from trusted source: {page.url}",
+                            summary=f"Linked from trusted source: {page.url}; anchor: {link.text[:300]}",
                             verification_status=VerificationStatus.UNVERIFIABLE,
                         ))
                         log_urls.append({"url": link.url, "decision": "UNVERIFIED_CANDIDATE"})
@@ -407,9 +490,19 @@ class ConferenceResearchService:
                         status="SOURCE_OPENED" if depth == 0 else "CATALOG_OPENED",
                         diagnostics=[], urls=log_urls,
                     ))
+                if task is not None:
+                    task.status, task.lease_until, task.error_code = "DONE", None, None
                 await self.session.commit()
             except Exception as exc:
                 await self.session.rollback()
+                if task is not None:
+                    task = await self.session.get(DiscoveryURLTask, task_id)
+                    task.status = "PENDING" if task.attempts < 3 else "FAILED"
+                    task.lease_until = None
+                    task.next_retry_at = (
+                        datetime.now(UTC) + timedelta(seconds=30 * 3 ** (task.attempts - 1))
+                    ).replace(tzinfo=None) if task.status == "PENDING" else None
+                    task.error_code = type(exc).__name__
                 errors.append(f"{url}: {type(exc).__name__}")
                 if self.discovery_job_id is not None:
                     self.session.add(DiscoverySearchAudit(
@@ -420,10 +513,16 @@ class ConferenceResearchService:
                         urls=[{"url": url, "decision": "SOURCE_UNAVAILABLE", "depth": depth}],
                     ))
                     await self.session.commit()
+        if self.discovery_job_id is not None:
+            pending = await self.session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == self.discovery_job_id,
+                DiscoveryURLTask.status.in_(["PENDING", "RUNNING"])))
+        else:
+            pending = len(queue)
         return {"new_ids": tuple(added_ids), "active_ids": tuple(active_ids),
                 "sources_opened": opened,
                 "sources_total": len(sources), "errors": tuple(errors),
-                "pending_catalogs": len(queue)}
+                "pending_catalogs": pending}
 
     async def search_fresh(
         self,
@@ -1046,14 +1145,28 @@ class ConferenceResearchService:
             await self.session.commit()
             raise CandidateExpiredError("event already ended")
         topics = await self._topic_contexts(candidate.user_id)
+        programme_sources = tuple(
+            (str(doc.url), doc.text[:3500])
+            for doc in documents
+            if self._has_scientific_programme_evidence((doc,))
+        )[:6]
         relevance = (
-            await self.ai.rank_research_relevance(verified, topics)
+            await self._rank_with_programme(verified, topics, programme_sources)
             if topics
             else RelevanceAssessment(score=1.0, explanation="Темы не настроены")
         )
         candidate.topic_relevance_score = relevance.score
         candidate.topic_relevance_reason = relevance.explanation
-        if relevance.score < self.min_relevance_score:
+        # Do not irreversibly mark a conference as low-relevance when the
+        # scientific programme is not published or was not accessible. The
+        # title alone cannot support a negative topical decision.
+        programme_evidence = self._has_scientific_programme_evidence(documents)
+        if relevance.score < self.min_relevance_score and not programme_evidence:
+            candidate.topic_relevance_reason = (
+                "Предварительная оценка; программа/секции/доклады не найдены. "
+                + relevance.explanation
+            )[:1000]
+        elif relevance.score < self.min_relevance_score:
             await self.repository.transition_candidate(
                 candidate.user_id,
                 candidate.id,
@@ -1083,6 +1196,32 @@ class ConferenceResearchService:
         await self.session.commit()
         await self._report(progress, "Проверенные сведения сохранены.")
         return verified
+
+    async def _rank_with_programme(
+        self,
+        research: VerifiedConferenceResearch,
+        topics: tuple[TopicRelevanceContext, ...],
+        programme_sources: tuple[tuple[str, str], ...],
+    ) -> RelevanceAssessment:
+        """Prefer evidence-backed programme scoring; preserve mock/provider compatibility."""
+        scorer = getattr(self.ai, "rank_research_programme_relevance", None)
+        if callable(scorer) and programme_sources:
+            return await scorer(research, topics, programme_sources)
+        return await self.ai.rank_research_relevance(research, topics)
+
+    @staticmethod
+    def _has_scientific_programme_evidence(documents: tuple[EvidenceDocument, ...]) -> bool:
+        """Require actual programme material, not a URL or a registration heading."""
+        marker = re.compile(
+            r"\b(?:scientific program(?:me)?|scientific sessions?|session topics?|"
+            r"contributed talks?|oral presentations?|invited talks?|poster sessions?|"
+            r"list of abstracts|abstract book|conference programme|"
+            r"научн\w* программ\w*|секци\w*|темы докладов|приглаш[её]нн\w* доклад\w*)\b",
+            re.I,
+        )
+        # A title/URL naming 'program' is insufficient: require the material in
+        # extracted page content, which contains the actual topic descriptions.
+        return any(marker.search(doc.text) for doc in documents)
 
     async def _topic_contexts(self, user_id: int) -> tuple[TopicRelevanceContext, ...]:
         topics = await TopicRepository(self.session).list_for_user(user_id)
@@ -1117,10 +1256,26 @@ class ConferenceResearchService:
         visited = {page.url.rstrip("/")}
         safe_links = self._safe_research_links(page.url, page_links)
         ranked_links = self._relevant_research_links(candidate.title, page.url, page_links)
+        program_marker = re.compile(
+            r"(?:program(?:me)?|scientific[ -]?topics?|sessions?|abstracts?|"
+            r"contributed[ -]?talks?|oral[ -]?presentations?|poster(?:s)?|"
+            r"speakers?|timetable|schedule|proceedings|"
+            r"программ[аыуе]|секци[яиий]|тематик[аи]|доклад[ыов]|тезис[ыов])",
+            re.I,
+        )
+        # Content of the actual scientific programme is more informative than
+        # the title of an event or an unrelated generic page.
+        ranked_links = tuple(sorted(
+            ranked_links,
+            key=lambda link: (
+                -bool(program_marker.search(f"{link.text} {link.url}")),
+                -self._research_link_score(candidate.title, link),
+            ),
+        ))
         queue = [
-            (link, 1)
-            for link in ranked_links
-            if self._research_link_score(candidate.title, link) > 0
+            (link, 1) for link in ranked_links
+            if program_marker.search(f"{link.text} {link.url}")
+            or self._research_link_score(candidate.title, link) > 0
         ]
         reserve = next(
             (
@@ -1133,7 +1288,7 @@ class ConferenceResearchService:
 
         async def fetch_link(link: PageLink, depth: int) -> tuple[PageLink, ...]:
             normalized_url = link.url.rstrip("/")
-            if normalized_url in visited:
+            if normalized_url in visited or is_document_url(link.url):
                 return ()
             visited.add(normalized_url)
             await self._report(progress, f"Проверяю связанную страницу: {link.url}")
@@ -1157,13 +1312,14 @@ class ConferenceResearchService:
                 related_links,
             )
 
-        while queue and len(documents) < 7:
+        while queue and len(documents) < 18:
             link, depth = queue.pop(0)
             children = await fetch_link(link, depth)
             queue.extend((child, depth + 1) for child in children)
 
-        if len(documents) < 7 and not self._documents_have_usable_temporal_research(
-            candidate.title, documents
+        if len(documents) < 18 and (
+            not self._documents_have_usable_temporal_research(candidate.title, documents)
+            or not self._has_scientific_programme_evidence(tuple(documents))
         ):
             selector = getattr(self.ai, "select_research_links", None)
             if callable(selector) and safe_links:
@@ -1186,17 +1342,17 @@ class ConferenceResearchService:
                             or urlsplit(selected.url).scheme not in {"http", "https"}
                             or urlsplit(selected.url).netloc.casefold() != page_host
                             or normalized in visited
-                            or len(documents) >= 7
+                            or len(documents) >= 18
                         ):
                             continue
                         children = await fetch_link(selected, 1)
                         queue.extend((child, 2) for child in children)
-                    while queue and len(documents) < 7:
+                    while queue and len(documents) < 18:
                         link, depth = queue.pop(0)
                         await fetch_link(link, depth)
         if (
             reserve is not None
-            and len(documents) < 7
+            and len(documents) < 18
             and not self._documents_have_usable_temporal_research(candidate.title, documents)
         ):
             await fetch_link(*reserve)
@@ -1218,6 +1374,7 @@ class ConferenceResearchService:
                 or normalized in seen
                 or parsed.scheme not in {"http", "https"}
                 or parsed.netloc.casefold() != page_host
+                or is_document_url(link.url)
                 or parsed.path.casefold().endswith(
                     (".pdf", ".jpg", ".jpeg", ".png", ".webp")
                 )
@@ -1225,7 +1382,7 @@ class ConferenceResearchService:
                 continue
             seen.add(normalized)
             selected.append(link)
-            if len(selected) >= 40:
+            if len(selected) >= 100:
                 break
         return tuple(selected)
 
@@ -1425,7 +1582,7 @@ class ConferenceResearchService:
                 reserve.append((similarity, -position, link))
         ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
         reserve.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        selected = [item[2] for item in ranked[:3]]
+        selected = [item[2] for item in ranked[:16]]
         if reserve:
             selected.append(reserve[0][2])
         return tuple(selected)
@@ -1437,6 +1594,15 @@ class ConferenceResearchService:
             "deadline",
             "registration",
             "abstract",
+            "scientific topic",
+            "session",
+            "speaker",
+            "poster",
+            "talk",
+            "proceedings",
+            "секци",
+            "доклад",
+            "программ",
             "call for paper",
             "call for contribution",
             "programme",

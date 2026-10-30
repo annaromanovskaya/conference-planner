@@ -1,4 +1,5 @@
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -147,6 +148,28 @@ class PageFetcher:
                             url=current,
                             http_status=response.status_code,
                         )
+                    # Browser fallback only for plausible client-rendered application shells.
+                    render_url = os.getenv("BROWSER_RENDER_URL", "").strip()
+                    visible = re.sub(r"<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>", "", html, flags=re.I | re.S)
+                    visible = re.sub(r"<[^>]+>", " ", visible)
+                    script_shell = len(re.sub(r"\s+", "", visible)) < 160 and bool(re.search(
+                        r"__NEXT_DATA__|id=[\"'](?:root|app|__next)[\"']|<script\b", html, re.I))
+                    if render_url and script_shell:
+                        try:
+                            rendered = await self.client.post(render_url, json={"url": current}, timeout=40)
+                            rendered.raise_for_status()
+                            data = rendered.json()
+                            rendered_html = str(data.get("html", ""))
+                            if rendered_html and len(rendered_html.encode("utf-8")) <= max_bytes:
+                                if looks_like_access_challenge(rendered_html):
+                                    raise FetchError("browser challenge", code="CAPTCHA_REQUIRED", url=current)
+                                html = rendered_html
+                                current = await self.safety.validate(str(data.get("url", current)))
+                        except FetchError:
+                            raise
+                        except (httpx.HTTPError, ValueError, TypeError) as exc:
+                            # Render failures do not erase valid HTTP evidence.
+                            pass
                     return FetchedPage(
                         current,
                         html,

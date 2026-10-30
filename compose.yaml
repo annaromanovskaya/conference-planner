@@ -4,8 +4,12 @@ services:
     image: confplanner:latest
     build: .
     env_file: [.env]
+    environment:
+      BROWSER_RENDER_URL: http://browser-worker:8765/render
     depends_on:
       searxng:
+        condition: service_started
+      browser-worker:
         condition: service_started
     volumes:
       - conference_data:/data
@@ -14,6 +18,21 @@ services:
     restart: unless-stopped
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+
+  browser-worker:
+    build:
+      context: ./deploy/browser
+    image: confplanner-browser:local
+    restart: unless-stopped
+    read_only: true
+    environment:
+      HOME: /tmp
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 1500m
+    shm_size: 256mb
 
   searxng:
     image: searxng/searxng:latest

@@ -11,6 +11,8 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
+    if sa.inspect(op.get_bind()).has_table("discovery_jobs"):
+        return
     op.create_table(
         "discovery_jobs",
         sa.Column("id", sa.Integer(), primary_key=True),

@@ -174,6 +174,27 @@ class AIService:
             RelevanceAssessment,
         )
 
+    async def rank_research_programme_relevance(
+        self,
+        research: object,
+        topics: object,
+        programme_sources: tuple[tuple[str, str], ...],
+    ) -> RelevanceAssessment:
+        """Evaluate actual session/talk/abstract descriptions with source URLs."""
+        payload = {
+            "conference": self._public_mapping(research),
+            "topics": self._public_mapping(topics),
+            "programme_evidence": [
+                {"source_url": url, "content": content}
+                for url, content in programme_sources
+            ],
+        }
+        return await self._validated(
+            RESEARCH_RELEVANCE_SYSTEM_PROMPT,
+            json.dumps(payload, ensure_ascii=False, default=str),
+            RelevanceAssessment,
+        )
+
     async def extract_conference_research(
         self,
         source_url: str,
