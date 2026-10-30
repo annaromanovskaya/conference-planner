@@ -1,4 +1,6 @@
 import json
+import os
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -12,6 +14,9 @@ from conference_planner.ai.models import (
     ToolCall,
     ToolDefinition,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAICompatibleGateway:
@@ -81,8 +86,13 @@ class OpenAICompatibleGateway:
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         try:
+            # Large scientific programme pages may need far more than the
+            # short timeout used by ordinary website fetches.
+            timeout_seconds = max(20.0, float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120")))
             response = await self.client.request(
-                method, f"{self.base_url}{path}", headers=self.headers, **kwargs
+                method, f"{self.base_url}{path}", headers=self.headers,
+                timeout=httpx.Timeout(connect=10.0, read=timeout_seconds, write=20.0, pool=20.0),
+                **kwargs,
             )
             response.raise_for_status()
             payload = response.json()
@@ -90,10 +100,22 @@ class OpenAICompatibleGateway:
                 raise ValueError("response must be an object")
             return payload
         except httpx.HTTPStatusError as exc:
-            code = "authentication" if exc.response.status_code in {401, 403} else "upstream_error"
-            raise ModelGatewayError("Model service request failed", code=code) from exc
-        except (httpx.HTTPError, ValueError) as exc:
-            raise ModelGatewayError("Model service request failed") from exc
+            status = exc.response.status_code
+            code = "authentication" if status in {401, 403} else f"http_{status}"
+            logger.warning("Local model API returned HTTP %d for %s", status, path)
+            raise ModelGatewayError(f"Model service HTTP {status}", code=code) from exc
+        except httpx.TimeoutException as exc:
+            logger.warning("Model API timeout during %s: %s", path, type(exc).__name__)
+            raise ModelGatewayError(
+                f"Model service timeout ({type(exc).__name__})", code="timeout"
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.warning("Model API transport failure during %s: %s", path, type(exc).__name__)
+            raise ModelGatewayError(
+                f"Model service transport error ({type(exc).__name__})", code="transport_error"
+            ) from exc
+        except ValueError as exc:
+            raise ModelGatewayError("Model service returned malformed JSON", code="invalid_json") from exc
 
     @staticmethod
     def _message_payload(message: ChatMessage) -> dict[str, Any]:

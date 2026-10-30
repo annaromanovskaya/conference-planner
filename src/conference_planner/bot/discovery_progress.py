@@ -121,14 +121,34 @@ class DiscoveryProgressController:
                 await session.commit()
                 await session.refresh(active)
             job_id = active.id
-            chat_id, message_id = active.chat_id, active.message_id
-        if message_id is None:
-            await self.attach_message(job_id, message)
-        else:
-            await message.answer(
-                f"🔎 Поиск уже выполняется. Задание №{job_id}; "
-                "прогресс обновляется в существующей карточке."
-            )
+            old_message_id = active.message_id
+            old_report_id = active.report_message_id
+            metrics = await self._progress(session, job_id)
+            body = render(active, metrics)
+        # Reusing the same background job must not force the user to scroll to
+        # an old Telegram message. Create a fresh live card for this request.
+        # Do not hold a DB transaction while talking to Telegram.
+        sent = await message.answer(body, reply_markup=keyboard(job_id))
+        async with self.sessions() as session:
+            job = await session.get(DiscoveryJob, job_id)
+            if job is not None:
+                job.chat_id = sent.chat.id
+                job.message_id = sent.message_id
+                job.report_message_id = None  # New report belongs beneath new card.
+                job.notified = False
+                await session.commit()
+        self._last.pop(job_id, None)
+        self._report_last.pop(job_id, None)
+        # Old cards must no longer offer misleading controls or look live.
+        if old_message_id is not None and old_message_id != sent.message_id:
+            try:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=sent.chat.id, message_id=old_message_id, reply_markup=None
+                )
+            except (TelegramBadRequest, TelegramRetryAfter):
+                pass
+        if old_report_id is not None:
+            await self.update_report(job_id, create=True)
         return job_id
 
     def enqueue_callback(self, session):
@@ -298,6 +318,12 @@ class DiscoveryProgressController:
             await session.execute(update(DiscoveryJob).where(
                 DiscoveryJob.status == "RUNNING"
             ).values(status="QUEUED", stage="QUEUED", updated_at=utc_now()))
+            # No worker from the previous process is alive: reclaim in-flight
+            # URL tasks immediately rather than waiting for stale leases.
+            from conference_planner.db.models import DiscoveryURLTask
+            await session.execute(update(DiscoveryURLTask).where(
+                DiscoveryURLTask.status == "RUNNING",
+            ).values(status="PENDING", lease_until=None, next_retry_at=None))
             await session.commit()
         self.tasks = [asyncio.create_task(self._worker(), name="discovery-worker"),
                       asyncio.create_task(self._notifier(), name="discovery-notifier")]
@@ -333,6 +359,24 @@ class DiscoveryProgressController:
                     await asyncio.sleep(2)
                     continue
                 await self._run_agent(job_id, years, query)
+                # Avoid a tight retry cycle when all remaining URL tasks are
+                # cooling down. Other Telegram operations stay responsive.
+                async with self.sessions() as session:
+                    from conference_planner.db.models import DiscoveryURLTask
+                    from sqlalchemy import func
+                    delay_until = await session.scalar(select(func.min(DiscoveryURLTask.next_retry_at)).where(
+                        DiscoveryURLTask.job_id == job_id,
+                        DiscoveryURLTask.status == "PENDING",
+                        DiscoveryURLTask.next_retry_at.is_not(None),
+                    ))
+                    pending_ready = await session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
+                        DiscoveryURLTask.job_id == job_id,
+                        DiscoveryURLTask.status == "PENDING",
+                        DiscoveryURLTask.next_retry_at.is_(None),
+                    ))
+                if delay_until is not None and not pending_ready:
+                    wait = (delay_until - utc_now()).total_seconds()
+                    await asyncio.sleep(min(30, max(2, wait)))
             except asyncio.CancelledError:
                 raise
             except Exception:

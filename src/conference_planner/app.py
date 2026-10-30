@@ -33,7 +33,7 @@ from conference_planner.conferences.cycle import (
     CycleMode,
     CycleRequest,
 )
-from conference_planner.conferences.deduplication import normalize_name
+from conference_planner.conferences.deduplication import normalize_name, canonical_url
 from conference_planner.conferences.discovery import DiscoveryService
 from conference_planner.conferences.evidence import EvidenceDocument, EvidenceValidator
 from conference_planner.conferences.monitoring import (
@@ -333,8 +333,16 @@ def _durable_conference_workflow(
                     not year_matches, not is_programme,
                     not official, -(item.relevance_score or 0), item.id)
         candidates_for_check.sort(key=priority)
+        def clearly_other_year(item):
+            # Only a year in the URL/path or event title is decisive at this
+            # pre-inspection stage; pages with no year remain eligible.
+            years = set(re.findall(r"(?<!\d)20\d{2}(?!\d)",
+                                   f"{item.title} {item.source_url}"))
+            return bool(requested_years and years and not years.intersection(requested_years))
         event_candidates = [item for item in candidates_for_check
-                            if not is_catalog_reference(item) and not is_document_url(item.source_url)]
+                            if not is_catalog_reference(item)
+                            and not is_document_url(item.source_url)
+                            and not clearly_other_year(item)]
         # No arbitrary candidate-count cutoff. Inspect the complete available
         # queue while execution time permits. Remaining candidates persist in
         # SQLite for a subsequent continuation (never silently discarded).
@@ -368,8 +376,37 @@ def _durable_conference_workflow(
                 task.next_retry_at = None
                 task.error_code = task.error_code or "RETRIES_EXHAUSTED"
             await session.commit()
+            # Older builds used candidate IDs as keys. Reconcile tasks by the
+            # actual URL before enqueuing anything new, preserving the first
+            # completed/active task and skipping duplicates already in SQLite.
+            existing_tasks = list(await session.scalars(select(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == discovery_job_id,
+                DiscoveryURLTask.task_type == "INSPECT",
+            ).order_by(DiscoveryURLTask.id)))
+            def url_identity(url):
+                return canonical_url(url) or url.strip()
+            by_url = {}
+            for existing in sorted(existing_tasks, key=lambda t: (
+                0 if t.status == "DONE" else 1 if t.status == "RUNNING" else 2,
+                t.id,
+            )):
+                key = url_identity(existing.url)
+                if key in by_url:
+                    # Preserve the evidence; these are duplicate work items,
+                    # not unique conferences to be researched again.
+                    if existing.status != "SKIPPED":
+                        existing.status = "SKIPPED"
+                        existing.error_code = "DUPLICATE_URL"
+                        existing.lease_until = None
+                        existing.next_retry_at = None
+                else:
+                    by_url[key] = existing
+            await session.commit()
             for item in event_candidates:
-                normalized = f"candidate:{item.id}"
+                normalized = url_identity(item.source_url)
+                if normalized in by_url:
+                    continue
+                by_url[normalized] = True
                 await session.execute(sqlite_insert(DiscoveryURLTask).values(
                     job_id=discovery_job_id, url=item.source_url,
                     normalized_url=normalized, candidate_id=item.id,
@@ -443,11 +480,13 @@ def _durable_conference_workflow(
                     continue
                 url = candidate.source_url
                 # Retire invalid or generic index pages already persisted by older releases.
-                if is_document_url(url) or is_catalog_reference(candidate):
+                if is_document_url(url) or is_catalog_reference(candidate) or clearly_other_year(candidate):
                     inspection_task = await session.get(DiscoveryURLTask, inspection_task_id)
                     inspection_task.status = "SKIPPED"
                     inspection_task.error_code = (
-                        "NON_HTML_DOCUMENT" if is_document_url(url) else "CATALOG_REFERENCE"
+                        "NON_HTML_DOCUMENT" if is_document_url(url) else
+                        "CATALOG_REFERENCE" if is_catalog_reference(candidate) else
+                        "OTHER_YEAR"
                     )
                     inspection_task.lease_until = None
                     await session.commit()
@@ -467,7 +506,14 @@ def _durable_conference_workflow(
                     # Ineligible and expired candidates are assessment outcomes,
                     # not infrastructure failures. Preserve this distinction in
                     # both the audit and the Telegram counters.
-                    if reason == "CandidateExpiredError":
+                    challenge = (
+                        "human verification challenge" in str(exc).casefold()
+                        or "captcha" in str(exc).casefold()
+                        or getattr(exc, "code", None) in ("ACCESS_CHALLENGE", "CAPTCHA")
+                    )
+                    if challenge:
+                        status = "ACCESS_RESTRICTED"
+                    elif reason == "CandidateExpiredError":
                         status = "EVENT_EXPIRED"
                         rejected_candidates += 1
                     elif reason in ("CandidateUnusableError", "CandidateRejectedError"):
@@ -495,7 +541,10 @@ def _durable_conference_workflow(
                         datetime.now(UTC) + timedelta(seconds=30 * 3 ** (inspection_task.attempts - 1))
                     ).replace(tzinfo=None)
                 else:
-                    inspection_task.status = "FAILED" if status == "INSPECTION_FAILED" else "DONE"
+                    inspection_task.status = (
+                        "FAILED" if status == "INSPECTION_FAILED" else
+                        "SKIPPED" if status == "ACCESS_RESTRICTED" else "DONE"
+                    )
                     inspection_task.next_retry_at = None
                 session.add(DiscoverySearchAudit(
                     job_id=discovery_job_id, query="[candidate page]", page=1,
