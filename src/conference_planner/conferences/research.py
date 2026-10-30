@@ -708,6 +708,8 @@ class ConferenceResearchService:
         progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> VerifiedConferenceResearch | CatalogExpansion:
         candidate = await self.repository.get_candidate(user_id, candidate_id)
+        if is_document_url(candidate.source_url):
+            raise CandidateUnusableError("non-HTML document is excluded from research")
         if candidate.status == CandidateStatus.SKIPPED and self._is_generic_title(candidate.title):
             siblings = [
                 item

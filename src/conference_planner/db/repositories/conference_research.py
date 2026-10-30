@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conference_planner.conferences.deduplication import normalize_name
+from conference_planner.conferences.page_urls import is_document_url
 from conference_planner.db.models import (
     ConferenceAlias,
     ConferenceChange,
@@ -56,7 +57,7 @@ class ConferenceResearchRepository:
             source_url = draft.source_url.strip()
             title = draft.title.strip()[:500]
             normalized_title = normalize_name(title)
-            if not source_url or not normalized_title:
+            if not source_url or not normalized_title or is_document_url(source_url):
                 continue
             identity = (source_url, normalized_title)
             candidate = seen_candidates.get(identity)
@@ -278,14 +279,17 @@ class ConferenceResearchRepository:
         *,
         limit: int = 20,
     ) -> list[EventCandidate]:
-        return list(
-            await self.session.scalars(
-                select(EventCandidate)
-                .where(EventCandidate.user_id == user_id, EventCandidate.status == status)
-                .order_by(EventCandidate.relevance_score.desc(), EventCandidate.id)
-                .limit(max(1, min(limit, self.MAX_CANDIDATES_PER_LIST)))
-            )
-        )
+        # Legacy database rows may contain PDFs and office documents from
+        # older crawler releases. Fetch sufficient rows before filtering so
+        # document entries never crowd real HTML candidates out of the list.
+        rows = list(await self.session.scalars(
+            select(EventCandidate)
+            .where(EventCandidate.user_id == user_id, EventCandidate.status == status)
+            .order_by(EventCandidate.relevance_score.desc(), EventCandidate.id)
+        ))
+        return [row for row in rows if not is_document_url(row.source_url)][
+            :max(1, min(limit, self.MAX_CANDIDATES_PER_LIST))
+        ]
 
     async def add_alias(self, conference_id: int, alias: str) -> ConferenceAlias:
         normalized = normalize_name(alias)

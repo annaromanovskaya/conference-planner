@@ -92,16 +92,17 @@ class WorkflowEngine:
             effective_budget,
             workflow_kind=workflow_kind,
         )
+        run_id = run.id
         await self.repository.session.commit()
         await self._emit(
             progress,
-            run.id,
+            run_id,
             ProgressEvent(
                 event_type=ProgressEventType.AGENT_STARTED,
                 message="Запущен план исследования конференций.",
             ),
         )
-        return await self._execute(run.id, progress)
+        return await self._execute(run_id, progress)
 
     async def resume(
         self,
@@ -179,23 +180,30 @@ class WorkflowEngine:
         budget: WorkflowBudget,
         progress: ProgressSink | None,
     ) -> AgentRunView | None:
-        handler = self.handlers.get(task.task_type)
+        # ORM objects can expire while progress callbacks and the handler use
+        # separate sessions. Never access their attributes after an await/commit
+        # when an immutable identifier is sufficient.
+        run_id = run.id
+        task_id = task.id
+        task_type = task.task_type
+        task_key = task.task_key
+        handler = self.handlers.get(task_type)
         if handler is None:
-            await self.repository.fail_task(task.id, "HANDLER_NOT_CONFIGURED", retryable=False)
+            await self.repository.fail_task(task_id, "HANDLER_NOT_CONFIGURED", retryable=False)
             await self.repository.session.commit()
-            return AgentRunView.model_validate(await self.repository.get_run_by_id(run.id))
-        dependencies = await self._dependency_artifacts(run.id, task)
+            return AgentRunView.model_validate(await self.repository.get_run_by_id(run_id))
+        dependencies = await self._dependency_artifacts(run_id, task)
         usage = self._usage(run)
         # Read queries implicitly begin transactions. Release them before a
         # progress sink writes through an independent SQLite connection.
         await self.repository.session.commit()
         await self._emit(
             progress,
-            run.id,
+            run_id,
             ProgressEvent(
                 event_type=ProgressEventType.TOOL_STARTED,
-                message=self._task_started_message(task.task_type),
-                safe_data={"task": task.task_key},
+                message=self._task_started_message(task_type),
+                safe_data={"task": task_key},
             ),
         )
         try:
@@ -204,36 +212,36 @@ class WorkflowEngine:
             )
         except WorkflowTaskFailure as exc:
             await self.repository.fail_task(
-                task.id, exc.error_code, retryable=exc.retryable
+                task_id, exc.error_code, retryable=exc.retryable
             )
             await self.repository.session.commit()
-            return AgentRunView.model_validate(await self.repository.get_run_by_id(run.id))
+            return AgentRunView.model_validate(await self.repository.get_run_by_id(run_id))
         projected = self._project_usage(usage, artifact)
         error_code = self._budget_error(projected, budget)
         if error_code is not None:
-            await self.repository.fail_task(task.id, error_code, retryable=False)
+            await self.repository.fail_task(task_id, error_code, retryable=False)
             await self.repository.set_run_state(
-                run.id, AgentRunStatus.PARTIAL, error_code=error_code
+                run_id, AgentRunStatus.PARTIAL, error_code=error_code
             )
             await self.repository.session.commit()
-            return AgentRunView.model_validate(await self.repository.get_run_by_id(run.id))
+            return AgentRunView.model_validate(await self.repository.get_run_by_id(run_id))
         stored = await self.repository.complete_task(
-            task.id,
+            task_id,
             artifact.artifact_kind,
             artifact.payload,
             artifact.source_hashes,
         )
         stored.validation_state = artifact.validation_state
         projected["tasks_completed"] = projected.get("tasks_completed", 0) + 1
-        await self.repository.update_usage(run.id, projected)
+        await self.repository.update_usage(run_id, projected)
         await self.repository.session.commit()
         await self._emit(
             progress,
-            run.id,
+            run_id,
             ProgressEvent(
                 event_type=ProgressEventType.TOOL_COMPLETED,
                 message=self._task_completed_message(
-                    task.task_type, artifact.artifact_kind
+                    task_type, artifact.artifact_kind
                 ),
                 safe_data={"artifact": artifact.artifact_kind},
             ),

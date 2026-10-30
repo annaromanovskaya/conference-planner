@@ -11,9 +11,13 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from conference_planner.db.base import utc_now
-from conference_planner.db.models import DiscoveryJob, DiscoverySearchAudit, DiscoveryURLTask
+from conference_planner.db.models import DiscoveryJob, DiscoverySearchAudit, DiscoveryURLTask, EventCandidate
+from conference_planner.schemas.common import CandidateStatus
+from conference_planner.conferences.page_urls import is_document_url
+from conference_planner.conferences.deduplication import canonical_url
 from conference_planner.schemas.common import AgentTaskType, AgentRunStatus, WorkflowKind
 from conference_planner.schemas.workflows import WorkflowBudget, WorkflowPlan, WorkflowTaskSpec
 
@@ -98,6 +102,9 @@ class DiscoveryProgressController:
         self._last: dict[int, str] = {}
         self._report_last: dict[int, str] = {}
         self._report_locks: dict[int, asyncio.Lock] = {}
+        # Limit recoveries of unexpected *workflow* failures in one process.
+        # Errors of individual pages are already handled inside the URL worker.
+        self._workflow_recovery_attempts: dict[int, int] = {}
 
     async def enqueue_query(self, user_id: int, query: str, message):
         """Idempotent entry point for free-text discovery requests."""
@@ -150,6 +157,66 @@ class DiscoveryProgressController:
         if old_report_id is not None:
             await self.update_report(job_id, create=True)
         return job_id
+
+    async def enqueue_candidate_review(self, user_id: int, message):
+        """Schedule *all* active HTML candidates, even when discovery is underway.
+
+        The owner asked to review candidates, not to repeat SearXNG. Persist the
+        work before sending Telegram a progress card. Each normalized URL gets
+        exactly one inspection task in this job.
+        """
+        async with self.sessions() as session:
+            active = await session.scalar(select(DiscoveryJob).where(
+                DiscoveryJob.user_id == user_id,
+                DiscoveryJob.status.in_(("QUEUED", "RUNNING", "CANCEL_REQUESTED")),
+            ).order_by(DiscoveryJob.id.desc()).limit(1))
+            if active is None:
+                recent = await session.scalar(select(DiscoveryJob).where(
+                    DiscoveryJob.user_id == user_id,
+                ).order_by(DiscoveryJob.id.desc()).limit(1))
+                years = list(recent.years) if recent and recent.years else [utc_now().year]
+                active = DiscoveryJob(
+                    user_id=user_id, years=years,
+                    query="__REVIEW_PENDING__ " + " ".join(map(str, years)),
+                    status="QUEUED", stage="QUEUED",
+                    created_at=utc_now(), updated_at=utc_now(),
+                )
+                session.add(active)
+                await session.flush()
+            job_id = active.id
+            review_years = list(active.years)
+            candidates = list(await session.scalars(select(EventCandidate).where(
+                EventCandidate.user_id == user_id,
+                EventCandidate.status == CandidateStatus.ACTIVE,
+            ).order_by(EventCandidate.id)))
+            existing = list(await session.scalars(select(DiscoveryURLTask).where(
+                DiscoveryURLTask.job_id == job_id,
+                DiscoveryURLTask.task_type == "INSPECT",
+            )))
+            seen = {task.normalized_url for task in existing}
+            queued = 0
+            for candidate in candidates:
+                url = candidate.source_url
+                if is_document_url(url):
+                    continue
+                normalized = canonical_url(url) or url.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                await session.execute(sqlite_insert(DiscoveryURLTask).values(
+                    job_id=job_id, url=url, normalized_url=normalized,
+                    candidate_id=candidate.id, root_url=url, parent_url=None,
+                    label=candidate.title[:300], task_type="INSPECT", depth=0,
+                    priority=0, status="PENDING", attempts=0,
+                    created_at=utc_now(), updated_at=utc_now(),
+                ).on_conflict_do_nothing(index_elements=[
+                    "job_id", "normalized_url", "task_type",
+                ]))
+                queued += 1
+            await session.commit()
+        # Attach an up-to-date card, maintaining a single live investigation.
+        await self.enqueue_query(user_id, "__REVIEW_PENDING__ " + " ".join(map(str, review_years)), message)
+        return job_id, queued
 
     def enqueue_callback(self, session):
         async def enqueue(user_id: int, years: list[int]):
@@ -318,9 +385,20 @@ class DiscoveryProgressController:
             await session.execute(update(DiscoveryJob).where(
                 DiscoveryJob.status == "RUNNING"
             ).values(status="QUEUED", stage="QUEUED", updated_at=utc_now()))
+            # A workflow infrastructure failure must not strand a durable URL
+            # queue. Requeue only searches that still have unfinished URL work.
+            from sqlalchemy import exists
+            await session.execute(update(DiscoveryJob).where(
+                DiscoveryJob.status == "FAILED",
+                DiscoveryJob.error_code == "AGENT_DISCOVERY_FAILED",
+                exists().where(
+                    DiscoveryURLTask.job_id == DiscoveryJob.id,
+                    DiscoveryURLTask.status.in_(("PENDING", "RUNNING")),
+                ),
+            ).values(status="QUEUED", stage="QUEUED", error_code=None,
+                     updated_at=utc_now()))
             # No worker from the previous process is alive: reclaim in-flight
             # URL tasks immediately rather than waiting for stale leases.
-            from conference_planner.db.models import DiscoveryURLTask
             await session.execute(update(DiscoveryURLTask).where(
                 DiscoveryURLTask.status == "RUNNING",
             ).values(status="PENDING", lease_until=None, next_retry_at=None))
@@ -362,7 +440,6 @@ class DiscoveryProgressController:
                 # Avoid a tight retry cycle when all remaining URL tasks are
                 # cooling down. Other Telegram operations stay responsive.
                 async with self.sessions() as session:
-                    from conference_planner.db.models import DiscoveryURLTask
                     from sqlalchemy import func
                     delay_until = await session.scalar(select(func.min(DiscoveryURLTask.next_retry_at)).where(
                         DiscoveryURLTask.job_id == job_id,
@@ -453,7 +530,7 @@ class DiscoveryProgressController:
                         "EMPTY" if search_code in ("SEARCH_EMPTY", "NO_RELEVANT_RESULTS") else
                         "PARTIAL" if search_code else "COMPLETED")
                     job.error_code = search_code
-                    if pending_tasks and result.status == AgentRunStatus.COMPLETED and job.status != "CANCELLED":
+                    if pending_tasks and job.status != "CANCELLED":
                         job.status = "QUEUED"
                         job.stage = "SEARCH"
                     else:
@@ -466,7 +543,33 @@ class DiscoveryProgressController:
             await self._finish(job_id, "CANCELLED")
         except Exception:
             logger.exception("agent discovery failed, job_id=%s", job_id)
-            await self._finish(job_id, "FAILED", "AGENT_DISCOVERY_FAILED")
+            # An infrastructure exception can leave the workflow RUNNING while
+            # the URL queue remains durable. Do not strand dozens of pages.
+            # A URL that was RUNNING at the point of failure is isolated so
+            # the next worker iteration can proceed to another URL.
+            async with self.sessions() as session:
+                pending = list(await session.scalars(select(DiscoveryURLTask).where(
+                    DiscoveryURLTask.job_id == job_id,
+                    DiscoveryURLTask.status.in_(("PENDING", "RUNNING")),
+                )))
+                for task in pending:
+                    if task.status == "RUNNING":
+                        task.status = "FAILED"
+                        task.error_code = "DISCOVERY_WORKFLOW_EXCEPTION"
+                        task.lease_until = None
+                        task.next_retry_at = None
+                job = await session.get(DiscoveryJob, job_id)
+                attempts = self._workflow_recovery_attempts.get(job_id, 0) + 1
+                self._workflow_recovery_attempts[job_id] = attempts
+                can_recover = bool(pending) and attempts <= 3 and job is not None
+                if job is not None:
+                    job.status = "QUEUED" if can_recover else "FAILED"
+                    job.stage = "QUEUED" if can_recover else "DONE"
+                    job.error_code = "WORKFLOW_RECOVERY" if can_recover else "AGENT_DISCOVERY_FAILED"
+                    job.updated_at = utc_now()
+                await session.commit()
+            if can_recover:
+                await asyncio.sleep(min(30, 3 * attempts))
 
     async def _finish(self, job_id, status, error_code=None):
         async with self.sessions() as session:

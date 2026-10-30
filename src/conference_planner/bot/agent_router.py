@@ -12,6 +12,7 @@ from aiogram.types import Message
 
 from conference_planner.agent.capabilities import capability_help_text, is_capability_question
 from conference_planner.agent.runtime import AgentReply, AgentRuntime
+from conference_planner.agent.intent import _wants_bulk_candidate_review
 from conference_planner.bot.command_catalog import UNKNOWN_COMMAND_TEXT
 from conference_planner.bot.keyboards import action_confirmation, main_menu
 from conference_planner.conferences.cycle import (
@@ -194,6 +195,12 @@ async def handle_free_text(
         text.casefold(),
     ):
         await message.answer(await discovery_controller.latest_search_report(owner_user_id))
+        return
+    if discovery_controller is not None and await _wants_bulk_candidate_review(
+        text, agent_runtime, owner_user_id
+    ):
+        await state.clear()
+        await discovery_controller.enqueue_candidate_review(owner_user_id, message)
         return
     memory_action = memory_action_from_text(text)
     if memory_action is not None and confirmation_service is not None:

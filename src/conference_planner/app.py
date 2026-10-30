@@ -249,10 +249,11 @@ def _durable_conference_workflow(
         # A resumed job must drain its persisted queue instead of repeating
         # the entire search and catalog crawl on every worker iteration.
         from types import SimpleNamespace
+        review_only = query.startswith("__REVIEW_PENDING__")
         existing_url_tasks = (await session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
             DiscoveryURLTask.job_id == discovery_job_id,
         ))) if discovery_job_id is not None else 0
-        if existing_url_tasks:
+        if existing_url_tasks or review_only:
             # A crash may have interrupted catalog crawling before it completed.
             # Drain remaining catalog tasks without repeating completed pages.
             pending_catalogs = await session.scalar(select(func.count()).select_from(DiscoveryURLTask).where(
@@ -357,7 +358,13 @@ def _durable_conference_workflow(
                 DiscoveryURLTask.status.in_(["PENDING", "RUNNING"]),
             )))
             for task in stale:
-                if is_document_url(task.url):
+                if task.error_code and ("human verification challenge" in task.error_code.casefold()
+                                        or "captcha" in task.error_code.casefold()):
+                    task.status = "SKIPPED"
+                    task.error_code = "ACCESS_RESTRICTED"
+                    task.lease_until = None
+                    task.next_retry_at = None
+                elif is_document_url(task.url):
                     task.status = "SKIPPED"
                     task.error_code = "NON_HTML_DOCUMENT"
                     task.lease_until = None
